@@ -69,6 +69,7 @@ Exclusion matching uses word-boundary regex, not substring — matching by subst
 
 ### Storage
 
+- Filtered comps are written to `sold_comps`, one row per surviving comp — not to `price_history`. `price_history`'s `UNIQUE (sneaker_id, platform, size, condition_type, date)` is an aggregate time series; individual sold comps don't belong there. Aggregating `sold_comps` into `price_history` (median, IQR fencing) is a separate downstream step, not part of this filtering pass.
 - Persist `listingType`; flag auction listings rather than excluding them.
   *— auctions clear below Buy It Now; keep separable rather than pre-excluded*
 

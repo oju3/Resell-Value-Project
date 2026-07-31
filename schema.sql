@@ -1,5 +1,5 @@
 -- Sneaker resale valuation app: core schema
--- 8 tables + RLS. See CLAUDE.md for project context.
+-- 10 tables + RLS. See CLAUDE.md for project context.
 
 -- 1. sneakers: master catalog
 CREATE TABLE sneakers (
@@ -105,6 +105,40 @@ CREATE TABLE projections (
     UNIQUE (sneaker_id, size, horizon)
 );
 
+-- 9. sold_comps: individual filtered eBay sold listings (raw comps, not aggregated)
+-- See docs/comp_filtering_spec.md. price_history aggregation is a separate
+-- downstream step that reads from this table; the actor backfill writes here.
+CREATE TABLE sold_comps (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
+    item_id TEXT NOT NULL UNIQUE,
+    title TEXT,
+    sold_price NUMERIC NOT NULL,
+    shipping_price NUMERIC,
+    total_price NUMERIC,
+    currency TEXT NOT NULL,
+    size TEXT,
+    condition_id INT NOT NULL,
+    listing_type TEXT,
+    thumbnail_url TEXT,
+    ended_at DATE NOT NULL,
+    source TEXT NOT NULL DEFAULT 'apify_ebay',
+    scraped_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_sold_comps_sneaker ON sold_comps (sneaker_id);
+CREATE INDEX idx_sold_comps_ended_at ON sold_comps (ended_at);
+
+-- 10. comp_rejections: audit log of comps dropped during filtering, and why
+CREATE TABLE comp_rejections (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
+    item_id TEXT,
+    title TEXT,
+    rejection_rule TEXT NOT NULL,
+    rejected_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_comp_rejections_sneaker ON comp_rejections (sneaker_id);
+
 -- Row Level Security
 ALTER TABLE sneakers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_history ENABLE ROW LEVEL SECURITY;
@@ -114,6 +148,8 @@ ALTER TABLE platform_fees ENABLE ROW LEVEL SECURITY;
 ALTER TABLE condition_multipliers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE lifecycle_curves ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sold_comps ENABLE ROW LEVEL SECURITY;
+ALTER TABLE comp_rejections ENABLE ROW LEVEL SECURITY;
 
 -- Public read on all market/reference data; writes only via service role (bypasses RLS)
 CREATE POLICY "public read" ON sneakers FOR SELECT USING (true);
@@ -123,6 +159,8 @@ CREATE POLICY "public read" ON platform_fees FOR SELECT USING (true);
 CREATE POLICY "public read" ON condition_multipliers FOR SELECT USING (true);
 CREATE POLICY "public read" ON lifecycle_curves FOR SELECT USING (true);
 CREATE POLICY "public read" ON projections FOR SELECT USING (true);
+CREATE POLICY "public read" ON sold_comps FOR SELECT USING (true);
+CREATE POLICY "public read" ON comp_rejections FOR SELECT USING (true);
 
 -- owned_sneakers: users can only touch their own rows
 CREATE POLICY "select own" ON owned_sneakers FOR SELECT USING (auth.uid() = user_id);
