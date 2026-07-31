@@ -17,6 +17,16 @@ Known gaps:
 
 Every rule below was derived by manually inspecting a 25-comp sample for the Jordan 4 Bred Reimagined (FV5029-006).
 
+## Scrape parameters
+
+`min_price` passed to the Apify actor is scaled by `hype_tier`, not constant:
+
+- Tier 1 → 150
+- Tier 2 → 120
+- Tier 3 → 80
+
+`min_price` is a cost-saving pre-filter to avoid paying to scrape kids/youth listings — it is **not** the kids filter (that's the title regex under Exclusions). A flat $150 floor was tested against tier-3 inventory and found to exclude most of the real market: UK sold/active data for Jordan 1 UNC Reimagined showed brand-new pairs clustering at £83–£115 (~$108–150 USD), meaning a $150 floor would capture only the expensive tail and inflate the median by an estimated 40–50% while still appearing valid. Tier-scaled floors keep the cost saving without truncating the distribution.
+
 ## Rules
 
 ### Exclusions
