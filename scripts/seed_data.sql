@@ -1,9 +1,12 @@
 -- Seed data for platform_fees and condition_multipliers
 
-INSERT INTO platform_fees (platform, fee_percent, fixed_fee, min_condition, default_days_to_sell) VALUES
-    ('stockx', 12.0, 0,    'deadstock', 3),
-    ('goat',   12.4, 5.00, 'good',      5),
-    ('ebay',   13.6, 0.30, 'any',       7);
+-- GOAT's 12.40% = 9.5% commission + 2.9% cash-out fee, bundled as one flat rate.
+-- StockX and GOAT rates assume a standard (Level 1) seller tier.
+INSERT INTO platform_fees (platform, fee_percent, fixed_fee, min_condition, default_days_to_sell, min_price, max_price) VALUES
+    ('ebay',   13.25, 0.30, 'any',       7, 0,   150),
+    ('ebay',    8.00, 0,    'any',       7, 150, NULL),
+    ('stockx', 12.00, 0,    'deadstock', 3, 0,   NULL),
+    ('goat',   12.40, 0,    'good',      5, 0,   NULL);
 
 INSERT INTO condition_multipliers (condition, multiplier, uncertainty_percent) VALUES
     ('deadstock', 1.00, 4),

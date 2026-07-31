@@ -58,13 +58,19 @@ CREATE TABLE owned_sneakers (
 CREATE INDEX idx_owned_sneakers_user_id ON owned_sneakers (user_id);
 
 -- 5. platform_fees: commission schedules per marketplace
+-- A platform can have multiple price-banded rows (e.g. eBay's $0-150 / $150+
+-- split), so uniqueness is enforced on (platform, min_price) rather than
+-- platform alone.
 CREATE TABLE platform_fees (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    platform TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL,
     fee_percent NUMERIC,
     fixed_fee NUMERIC,
     min_condition TEXT,
-    default_days_to_sell INT
+    default_days_to_sell INT,
+    min_price NUMERIC,
+    max_price NUMERIC,
+    UNIQUE (platform, min_price)
 );
 
 -- 6. condition_multipliers: value retention by wear level
