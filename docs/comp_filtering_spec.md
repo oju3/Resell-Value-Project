@@ -25,7 +25,7 @@ Exclusion matching uses word-boundary regex, not substring — matching by subst
 
 - Exclude titles matching `\bGS\b`, `\(PS\)`, `\(TD\)`, `\bYouth\b`, `\bToddler\b`, `Big Kids`, `Little Kids`, `Preschool`.
   *— 2.6x price gap observed between PS and men's on identical colourway ($89 vs $233 equivalent). Largest single source of contamination.*
-- Exclude titles matching `lot of`, `rs`, `bundle`.
+- Exclude titles matching `lot of`, `2 pairs`, `bundle`.
   *— aggregate price, not unit price*
 
 ### Size
@@ -49,7 +49,7 @@ Exclusion matching uses word-boundary regex, not substring — matching by subst
 
 - `conditionId` 1000 maps to the deadstock baseline.
 - `conditionId` 1500 is persisted but excluded from the baseline.
-  *— baseline anchors all six derived tiers; contaminating r everywhere*
+  *— baseline anchors all six derived tiers; contaminating it propagates error everywhere*
 - `conditionId` 3000 maps to the used tiers.
 
 ### Aggregation
@@ -74,4 +74,5 @@ Exclusion matching uses word-boundary regex, not substring — matching by subst
 
 ## Open questions
 
-- None marked BLOCKED. Every rule above maps to a field returned by the Apify actor (`title`, `conditionId`, `thumbnailUrl`, `listingType`, `soldPrice`). The one hard field-level gap — no seller identifier — is a permanent data-source constraint, not an open design question, and is filed under Known limitations instead.
+- **Model-variant contamination — BLOCKED.** A Mid listing was observed at $144 against an OG median of ~$205 for the same colourway. Filtering this requires distinguishing OG/High from Mid/Low, which needs a model-variant field on the `sneakers` table. Checked: no such field exists — `sneakers` has `id`, `name`, `brand`, `style_code`, `colorway`, `image_url`, `release_date`, `hype_tier`, none of which encode model variant.
+- No other items marked BLOCKED. Every other rule above maps to a field returned by the Apify actor (`title`, `conditionId`, `thumbnailUrl`, `listingType`, `soldPrice`). The one hard field-level gap — no seller identifier — is a permanent data-source constraint, not an open design question, and is filed under Known limitations instead.
