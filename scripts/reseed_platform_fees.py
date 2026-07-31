@@ -44,13 +44,19 @@ try:
             cur.execute(f'ALTER TABLE platform_fees DROP CONSTRAINT "{old_constraint[0]}";')
 
         cur.execute("""
-            ALTER TABLE platform_fees
-                ADD CONSTRAINT platform_fees_platform_min_price_key UNIQUE (platform, min_price);
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'platform_fees'::regclass
+              AND conname = 'platform_fees_platform_min_price_key';
         """)
+        if not cur.fetchone():
+            cur.execute("""
+                ALTER TABLE platform_fees
+                    ADD CONSTRAINT platform_fees_platform_min_price_key UNIQUE (platform, min_price);
+            """)
 
         cur.execute("DELETE FROM platform_fees;")
 
-        # GOAT's 12.40% = 9.5% commission + 2.9% cash-out fee, bundled as one flat rate.
+        # GOAT's 12.40% + $5.00 = 9.5% commission + $5 US seller fee + 2.9% cash-out fee.
         # StockX and GOAT rates assume a standard (Level 1) seller tier.
         cur.execute("""
             INSERT INTO platform_fees
@@ -59,7 +65,7 @@ try:
                 ('ebay',   13.25, 0.30, 'any',       7, 0,   150),
                 ('ebay',    8.00, 0,    'any',       7, 150, NULL),
                 ('stockx', 12.00, 0,    'deadstock', 3, 0,   NULL),
-                ('goat',   12.40, 0,    'good',      5, 0,   NULL);
+                ('goat',   12.40, 5.00, 'good',      5, 0,   NULL);
         """)
     conn.commit()
     print("platform_fees reseeded successfully.\n")
