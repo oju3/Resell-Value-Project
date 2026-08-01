@@ -84,6 +84,7 @@ class Stats:
         self.cost_fully_known = True
         self.rows_written = 0
         self.rows_rejected = 0
+        self.conflict_skips = 0
         self.low_confidence_sneakers = []
 
 
@@ -293,7 +294,12 @@ def load_cached_response(style_code):
 
 
 def write_comps(conn, sneaker_id, rows):
+    """Returns (written, skipped_item_ids). skipped_item_ids are rows whose item_id
+    already existed in sold_comps (ON CONFLICT DO NOTHING triggered) — e.g. the same
+    eBay listing matched an earlier sneaker's search query, since item_id is unique
+    across the whole table, not per sneaker."""
     written = 0
+    skipped_item_ids = []
     with conn.cursor() as cur:
         for row in rows:
             cur.execute(
@@ -308,8 +314,22 @@ def write_comps(conn, sneaker_id, rows):
                  row["total_price"], row["currency"], row["size"], row["condition_id"],
                  row["listing_type"], row["thumbnail_url"], row["ended_at"]),
             )
-            written += cur.rowcount
-    return written
+            if cur.rowcount:
+                written += cur.rowcount
+            else:
+                skipped_item_ids.append(row["item_id"])
+    return written, skipped_item_ids
+
+
+def find_existing_owners(conn, item_ids):
+    """Looks up which sneaker_id already holds each given item_id, so a skipped
+    (deduped) row can be reported as 'already scraped under sneaker X' rather than
+    just a bare count."""
+    if not item_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT item_id, sneaker_id FROM sold_comps WHERE item_id = ANY(%s)", (item_ids,))
+        return dict(cur.fetchall())
 
 
 def log_rejections(conn, sneaker_id, rejected_items):
@@ -377,11 +397,14 @@ def process_sneaker(conn, token, sneaker, args, stats):
             rejections_by_rule[result] = rejections_by_rule.get(result, 0) + 1
 
     written = len(accepted_rows)
+    skipped_item_ids = []
+    skip_owners = {}
     if not args.dry_run:
         try:
-            written = write_comps(conn, sneaker_id, accepted_rows)
+            written, skipped_item_ids = write_comps(conn, sneaker_id, accepted_rows)
             log_rejections(conn, sneaker_id, rejected_items)
             conn.commit()
+            skip_owners = find_existing_owners(conn, skipped_item_ids)
         except Exception as e:
             conn.rollback()
             print(f"[{name}] DB WRITE ERROR — {e}", file=sys.stderr)
@@ -408,6 +431,14 @@ def process_sneaker(conn, token, sneaker, args, stats):
     )
     print(f"    deadstock_median (conditionId=1000 only, n={len(deadstock_prices)}): {deadstock_median_display}")
     print(f"    all_conditions_median (mixed conditionId, n={len(all_prices)}): {all_median_display}")
+    if skipped_item_ids:
+        print(f"    ON CONFLICT skips: {len(skipped_item_ids)} (surviving={survivor_count} but only {written} newly inserted)")
+        for item_id in skipped_item_ids:
+            owner = skip_owners.get(item_id)
+            if owner is not None and owner != sneaker_id:
+                print(f"      item_id={item_id} already in sold_comps under sneaker_id={owner} (cross-sneaker duplicate listing)")
+            else:
+                print(f"      item_id={item_id} already in sold_comps under this sneaker (rerun)")
     print(
         "    surviving conditionId breakdown: "
         f"1000={condition_counts.get(1000, 0)} "
@@ -420,6 +451,7 @@ def process_sneaker(conn, token, sneaker, args, stats):
 
     stats.rows_written += written
     stats.rows_rejected += len(rejected_items)
+    stats.conflict_skips += len(skipped_item_ids)
     if low_confidence:
         stats.low_confidence_sneakers.append(name)
 
@@ -483,6 +515,7 @@ def main():
     print(f"Total cost: ${stats.total_cost:.4f}{cost_note}")
     print(f"Rows written: {stats.rows_written}{' (dry-run, not persisted)' if args.dry_run else ''}")
     print(f"Rows rejected: {stats.rows_rejected}")
+    print(f"ON CONFLICT skips (surviving rows not newly inserted): {stats.conflict_skips}")
     print(f"Sneakers flagged low_confidence: {len(stats.low_confidence_sneakers)}")
     if stats.low_confidence_sneakers:
         for name in stats.low_confidence_sneakers:
