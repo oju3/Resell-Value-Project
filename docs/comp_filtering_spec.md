@@ -80,7 +80,7 @@ Exclusion matching uses word-boundary regex, not substring — matching by subst
 
 ## Known limitations
 
-- Per-seller concentration can't be capped or detected. No seller field is returned by the actor, so the bulk-seller pattern caught by thumbnail dedup (one seller holding 12% of the 25-comp sample) can't be generalized into a systematic per-seller cap.
+- Per-seller concentration can't be capped or detected. The actor does return a `sellerUsername` field, but it was null in 20/20 observed rows (DM7866-162 cache), so it carries no usable signal — the bulk-seller pattern caught by thumbnail dedup (one seller holding 12% of the 25-comp sample) can't be generalized into a systematic per-seller cap. Deduplication falls back to `thumbnailUrl` instead.
 - Condition sub-tiers below "Pre-Owned" can't be distinguished. eBay only exposes three `conditionId` values (1000 Brand New, 1500 New Other, 3000 Pre-Owned), but `condition_multipliers` has six tiers anchored on deadstock = 1.00. Everything eBay buckets as 3000 is filtered as one undifferentiated group — vnds, worn_once, fair, and beat aren't separable from source data.
 
 ## Open questions
