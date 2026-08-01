@@ -52,7 +52,7 @@ RAW_COMPS_DIR = ROOT / "data" / "raw_comps"
 
 ACTOR_ID = "caffein.dev~ebay-sold-listings"
 ACTOR_RUN_URL = f"https://api.apify.com/v2/acts/{ACTOR_ID}/run-sync-get-dataset-items"
-ACTOR_RUN_INFO_URL = "https://api.apify.com/v2/actor-runs/{run_id}"
+ACTOR_RECENT_RUNS_URL = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
 
 DAYS_TO_SCRAPE = 90
 
@@ -116,9 +116,7 @@ def call_actor(token, query, min_price, count):
     )
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
-            body = resp.read()
-            run_id = resp.headers.get("x-apify-run-id")
-            return json.loads(body), run_id
+            return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:500]
         raise RuntimeError(f"actor call failed ({redact_url(url)}): HTTP {e.code}: {detail}") from None
@@ -126,20 +124,37 @@ def call_actor(token, query, min_price, count):
         raise RuntimeError(f"actor call failed ({redact_url(url)}): {e.reason}") from None
 
 
-def fetch_run_cost(token, run_id):
-    """Best-effort: run-sync-get-dataset-items doesn't return cost in its body,
-    so this makes a lightweight follow-up call to the run-info endpoint. Returns
-    None (not 0) if the run id, field, or call itself is unavailable."""
-    if not run_id:
-        return None
-    url = ACTOR_RUN_INFO_URL.format(run_id=run_id) + "?" + urllib.parse.urlencode({"token": token})
+def fetch_run_cost(token):
+    """Best-effort: run-sync-get-dataset-items returns neither a run id nor cost
+    data in its response (confirmed against Apify's OpenAPI spec — the only
+    documented headers are the X-Apify-Pagination-* ones), so there's no run id
+    to look up cost by. Instead, since call_actor blocks until the run finishes,
+    the run we just paid for is the actor's most recently finished run — fetch it
+    from the runs list, which includes usageTotalUsd directly. Returns None (not
+    0) if that run can't be confidently identified as ours or the call fails."""
+    url = ACTOR_RECENT_RUNS_URL + "?" + urllib.parse.urlencode({"token": token, "desc": "true", "limit": 1})
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
-            return data.get("data", {}).get("usageTotalUsd")
     except Exception:
         return None
+    items = data.get("data", {}).get("items", [])
+    if not items:
+        return None
+    run = items[0]
+    if run.get("status") != "SUCCEEDED":
+        return None
+    finished_at = run.get("finishedAt")
+    if not finished_at:
+        return None
+    try:
+        finished = datetime.strptime(finished_at, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return None
+    if (datetime.utcnow() - finished).total_seconds() > 120:
+        return None
+    return run.get("usageTotalUsd")
 
 
 def extract_size(title):
@@ -333,13 +348,13 @@ def process_sneaker(conn, token, sneaker, args, stats):
 
         query = f"{name} {style_code}"
         try:
-            items, run_id = call_actor(token, query, min_price, args.count)
+            items = call_actor(token, query, min_price, args.count)
         except Exception as e:
             print(f"[{name}] ACTOR ERROR — {e}", file=sys.stderr)
             return "actor_error"
 
         stats.actor_calls += 1
-        cost = fetch_run_cost(token, run_id)
+        cost = fetch_run_cost(token)
         if cost is not None:
             stats.total_cost += cost
             cost_display = f"${stats.total_cost:.4f}"
