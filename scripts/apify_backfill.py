@@ -374,13 +374,30 @@ def process_sneaker(conn, token, sneaker, args, stats):
 
     survivor_count = len(accepted_rows)
     low_confidence = survivor_count < 5
-    median_price = statistics.median([r["sold_price"] for r in accepted_rows]) if accepted_rows else None
-    median_display = f"${median_price:.2f}" if median_price is not None else "n/a"
+
+    condition_counts = {}
+    for r in accepted_rows:
+        condition_counts[r["condition_id"]] = condition_counts.get(r["condition_id"], 0) + 1
+
+    all_prices = [r["sold_price"] for r in accepted_rows]
+    deadstock_prices = [r["sold_price"] for r in accepted_rows if r["condition_id"] == 1000]
+    all_median = statistics.median(all_prices) if all_prices else None
+    deadstock_median = statistics.median(deadstock_prices) if deadstock_prices else None
+    all_median_display = f"${all_median:.2f}" if all_median is not None else "n/a"
+    deadstock_median_display = f"${deadstock_median:.2f}" if deadstock_median is not None else "n/a"
 
     print(
         f"[{name}] tier={hype_tier} raw={len(items)} surviving={survivor_count} "
         f"written={written}{' (dry-run, not persisted)' if args.dry_run else ''} "
-        f"median={median_display} low_confidence={low_confidence}"
+        f"low_confidence={low_confidence}"
+    )
+    print(f"    deadstock_median (conditionId=1000 only, n={len(deadstock_prices)}): {deadstock_median_display}")
+    print(f"    all_conditions_median (mixed conditionId, n={len(all_prices)}): {all_median_display}")
+    print(
+        "    surviving conditionId breakdown: "
+        f"1000={condition_counts.get(1000, 0)} "
+        f"1500={condition_counts.get(1500, 0)} "
+        f"3000={condition_counts.get(3000, 0)}"
     )
     for rule, n in sorted(rejections_by_rule.items()):
         print(f"    rejected[{rule}]: {n}")
