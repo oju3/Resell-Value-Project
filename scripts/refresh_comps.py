@@ -20,19 +20,25 @@ would need to replicate that "only on success" semantics by hand and would
 be a second source of truth that can drift from sold_comps; the existing
 column already gives the right behavior for free.
 
+Every attempt (not just failures) is logged to refresh_runs — a table kept
+separate from comp_rejections on purpose. comp_rejections is strictly
+per-listing (one row per rejected comp, per docs/comp_filtering_spec.md's
+Auditing section); refresh_runs is per-sneaker-per-attempt bookkeeping for
+this job, including outcome = 'ok' runs, which is what makes spend-per-sneaker
+analysis possible later, not just failure forensics. See
+docs/refresh_schedule.md.
+
 Stall detection: a sneaker whose actor call succeeds but yields zero newly-
 inserted rows (e.g. every returned comp is already in sold_comps under a
 different sneaker_id — see the cross-colourway contamination BLOCKED item in
 docs/comp_filtering_spec.md) never advances its scraped_at, so it can be
 re-selected every run, burning budget without the catalogue rotating
 forward. This job cannot fix that (the underlying keyword-matching issue is
-BLOCKED for Phase 3) but it does detect and surface it: any sneaker with
-written == 0 this run is logged to comp_rejections as rejection_rule =
-'stalled_no_new_rows' (item_id/title NULL — it's a per-run marker, not a
-per-comp rejection) and reported in the run summary. If the same sneaker's
-previous 'stalled_no_new_rows' marker has no successful sold_comps write
-after it, this run's stall is flagged as CONSECUTIVE and printed loudly in
-the summary so it doesn't go unnoticed. See docs/refresh_schedule.md.
+BLOCKED for Phase 3) but it does detect and surface it: such a run is logged
+to refresh_runs with outcome = 'stalled' and reported in the run summary. If
+the immediately preceding refresh_runs row for that sneaker also has
+outcome = 'stalled', this run's stall is flagged as CONSECUTIVE and printed
+loudly in the summary so it doesn't go unnoticed.
 
 Does NOT save raw actor responses to data/raw_comps/ — that directory exists
 for the one-time backfill's --from-cache re-filtering replay. This job has
@@ -89,8 +95,6 @@ SLEEP_BETWEEN_CALLS_SECONDS = 2
 
 # --- End config. ---
 
-STALL_RULE = "stalled_no_new_rows"
-
 
 class Stats:
     def __init__(self):
@@ -125,35 +129,33 @@ def select_sneakers_to_refresh(conn, limit):
         return cur.fetchall()
 
 
-def previous_stall_at(conn, sneaker_id):
+def fetch_last_outcome(conn, sneaker_id):
+    """Most recent refresh_runs.outcome for this sneaker, or None if it's
+    never been attempted. Read before this run's row is inserted, so the
+    consecutive-stall check compares against the prior attempt, not itself."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT rejected_at FROM comp_rejections
-            WHERE sneaker_id = %s AND rejection_rule = %s
-            ORDER BY rejected_at DESC
+            SELECT outcome FROM refresh_runs
+            WHERE sneaker_id = %s
+            ORDER BY run_at DESC
             LIMIT 1
             """,
-            (sneaker_id, STALL_RULE),
+            (sneaker_id,),
         )
         row = cur.fetchone()
         return row[0] if row else None
 
 
-def has_write_since(conn, sneaker_id, since):
+def log_run(conn, sneaker_id, raw_returned, new_rows_inserted, on_conflict_skipped, outcome):
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT 1 FROM sold_comps WHERE sneaker_id = %s AND scraped_at > %s LIMIT 1",
-            (sneaker_id, since),
-        )
-        return cur.fetchone() is not None
-
-
-def log_stall(conn, sneaker_id):
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO comp_rejections (sneaker_id, item_id, title, rejection_rule) VALUES (%s, NULL, NULL, %s)",
-            (sneaker_id, STALL_RULE),
+            """
+            INSERT INTO refresh_runs
+                (sneaker_id, raw_returned, new_rows_inserted, on_conflict_skipped, outcome)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (sneaker_id, raw_returned, new_rows_inserted, on_conflict_skipped, outcome),
         )
 
 
@@ -171,11 +173,21 @@ def process_sneaker(conn, token, sneaker, stats):
     if stats.actor_calls > 0:
         time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
 
+    # Read before this run's own refresh_runs row is inserted, so the
+    # consecutive-stall check below compares against the prior attempt.
+    prev_outcome = fetch_last_outcome(conn, sneaker_id)
+
     query = f"{name} {style_code}"
     try:
         items = call_actor(token, query, min_price, COMPS_PER_SNEAKER, DAYS_TO_SCRAPE)
     except Exception as e:
         print(f"[{name}] ACTOR ERROR — {e}", file=sys.stderr)
+        try:
+            log_run(conn, sneaker_id, None, None, None, "actor_error")
+            conn.commit()
+        except Exception as log_e:
+            conn.rollback()
+            print(f"[{name}] DB WRITE ERROR (run log) — {log_e}", file=sys.stderr)
         return "actor_error"
 
     stats.actor_calls += 1
@@ -199,6 +211,12 @@ def process_sneaker(conn, token, sneaker, stats):
     except Exception as e:
         conn.rollback()
         print(f"[{name}] DB WRITE ERROR — {e}", file=sys.stderr)
+        try:
+            log_run(conn, sneaker_id, len(items), None, None, "db_error")
+            conn.commit()
+        except Exception as log_e:
+            conn.rollback()
+            print(f"[{name}] DB WRITE ERROR (run log) — {log_e}", file=sys.stderr)
         return "db_error"
 
     print(
@@ -208,26 +226,27 @@ def process_sneaker(conn, token, sneaker, stats):
     for rule, n in sorted(rejections_by_rule.items()):
         print(f"    rejected[{rule}]: {n}")
 
-    if written == 0:
-        prev_stall = previous_stall_at(conn, sneaker_id)
-        consecutive = prev_stall is not None and not has_write_since(conn, sneaker_id, prev_stall)
-        try:
-            log_stall(conn, sneaker_id)
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            print(f"[{name}] DB WRITE ERROR (stall marker) — {e}", file=sys.stderr)
+    run_outcome = "stalled" if written == 0 else "ok"
+    try:
+        log_run(conn, sneaker_id, len(items), written, len(skipped_item_ids), run_outcome)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[{name}] DB WRITE ERROR (run log) — {e}", file=sys.stderr)
+
+    if run_outcome == "stalled":
+        consecutive = prev_outcome == "stalled"
         stats.stalled_sneakers.append(name)
         if consecutive:
             stats.consecutive_stall_sneakers.append(name)
             print(
-                f"    !!! CONSECUTIVE STALL — {name} has produced zero new rows across "
-                f"multiple runs with no successful write in between. Likely cross-colourway "
-                f"contamination (docs/comp_filtering_spec.md, 'Cross-colourway keyword "
-                f"contamination — BLOCKED'). Investigate before it burns further budget. !!!"
+                f"    !!! CONSECUTIVE STALL — {name} has produced zero new rows on back-to-back "
+                f"attempts. Likely cross-colourway contamination (docs/comp_filtering_spec.md, "
+                f"'Cross-colourway keyword contamination — BLOCKED'). Investigate before it burns "
+                f"further budget. !!!"
             )
         else:
-            print(f"    STALLED — 0 new rows this run (raw={len(items)}); logged as {STALL_RULE}")
+            print(f"    STALLED — 0 new rows this run (raw={len(items)}); logged to refresh_runs")
 
     stats.rows_written += written
     stats.rows_rejected += len(rejected_items)

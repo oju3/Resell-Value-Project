@@ -128,7 +128,12 @@ CREATE TABLE sold_comps (
 CREATE INDEX idx_sold_comps_sneaker ON sold_comps (sneaker_id);
 CREATE INDEX idx_sold_comps_ended_at ON sold_comps (ended_at);
 
--- 10. comp_rejections: audit log of comps dropped during filtering, and why
+-- 10. comp_rejections: audit log of comps dropped during filtering, and why.
+-- Strictly per-listing: one row per rejected comp, per docs/comp_filtering_spec.md's
+-- Auditing section. Per-sneaker-per-refresh-attempt bookkeeping (including the
+-- refresh job's stall detection) lives in refresh_runs instead, not here --
+-- see docs/refresh_schedule.md. A rejection_rule in this table always maps to
+-- a real rejected listing with a real item_id; do not add run-level markers.
 CREATE TABLE comp_rejections (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
@@ -166,6 +171,22 @@ COMMENT ON TABLE platform_multipliers IS
     'price on the target platform, never the reverse. Multiplier and fee are separate stages and must '
     'not be collapsed into one number.';
 
+-- 12. refresh_runs: per-sneaker-per-attempt log written by scripts/refresh_comps.py,
+-- one row every time the recurring refresh job attempts a sneaker (not just on
+-- failure) -- 'ok' rows are what make spend-per-sneaker analysis possible later,
+-- not just failure forensics. Distinct from comp_rejections (per-listing); this
+-- is per-attempt bookkeeping. See docs/refresh_schedule.md.
+CREATE TABLE refresh_runs (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
+    run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    raw_returned INT,
+    new_rows_inserted INT,
+    on_conflict_skipped INT,
+    outcome TEXT NOT NULL CHECK (outcome IN ('ok', 'stalled', 'actor_error', 'db_error'))
+);
+CREATE INDEX idx_refresh_runs_sneaker_run_at ON refresh_runs (sneaker_id, run_at DESC);
+
 -- Row Level Security
 ALTER TABLE sneakers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_history ENABLE ROW LEVEL SECURITY;
@@ -178,6 +199,7 @@ ALTER TABLE projections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sold_comps ENABLE ROW LEVEL SECURITY;
 ALTER TABLE comp_rejections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE platform_multipliers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE refresh_runs ENABLE ROW LEVEL SECURITY;
 
 -- Public read on all market/reference data; writes only via service role (bypasses RLS)
 CREATE POLICY "public read" ON sneakers FOR SELECT USING (true);
@@ -190,6 +212,7 @@ CREATE POLICY "public read" ON projections FOR SELECT USING (true);
 CREATE POLICY "public read" ON sold_comps FOR SELECT USING (true);
 CREATE POLICY "public read" ON comp_rejections FOR SELECT USING (true);
 CREATE POLICY "public read" ON platform_multipliers FOR SELECT USING (true);
+CREATE POLICY "public read" ON refresh_runs FOR SELECT USING (true);
 
 -- owned_sneakers: users can only touch their own rows
 CREATE POLICY "select own" ON owned_sneakers FOR SELECT USING (auth.uid() = user_id);

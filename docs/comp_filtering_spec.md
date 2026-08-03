@@ -77,6 +77,7 @@ Exclusion matching uses word-boundary regex, not substring — matching by subst
 
 - Log every rejected row with the rule that rejected it. No silent discards.
   *— if a sneaker returns zero comps, that must be diagnosable*
+- `comp_rejections` is strictly per-listing: one row per individual comp that failed a filter rule above, with a real `item_id`/`title`. It does not hold per-sneaker or per-run bookkeeping — e.g. the recurring refresh job's (`scripts/refresh_comps.py`) stall detection logs to a separate `refresh_runs` table instead (see `docs/refresh_schedule.md`), specifically so a `rejection_rule` count grouped from this table always means "count of rejected listings," never a mix of listing-level and run-level events.
 
 ## Known limitations
 

@@ -89,21 +89,23 @@ zero-progress, non-zero-cost cycle indefinitely and starving other sneakers
 of their rotation slot.
 
 This job does not fix that (the underlying title-to-SKU matching problem is
-explicitly deferred to Phase 3). It only detects and surfaces it, cheaply,
-by reusing the existing `comp_rejections` audit table rather than adding new
-schema:
+explicitly deferred to Phase 3). It only detects and surfaces it, using the
+dedicated `refresh_runs` table (see "Two audit tables, two grains" below) —
+not `comp_rejections`, which stays strictly per-listing:
 
-- Any run where a sneaker's `written == 0` inserts a `comp_rejections` row
-  for that sneaker with `rejection_rule = 'stalled_no_new_rows'` and
-  `item_id`/`title` left `NULL` — this is a per-run marker, not a per-comp
-  rejection, so it's distinguishable from the filter-rule rejections logged
-  by the same table.
-- Before inserting this run's marker, `refresh_comps.py` checks whether the
-  *previous* `stalled_no_new_rows` marker for that sneaker (if any) has had a
-  successful `sold_comps` write after it. If not — no recovery happened
-  between the two stalls — this run's stall is flagged **consecutive** and
-  printed as a loud, impossible-to-miss warning block in the run summary,
-  distinct from the routine per-sneaker stall line.
+- Every attempt writes a `refresh_runs` row: `sneaker_id`, `run_at`,
+  `raw_returned`, `new_rows_inserted`, `on_conflict_skipped`, and an
+  `outcome` of `'ok'`, `'stalled'`, `'actor_error'`, or `'db_error'`.
+  `'ok'` rows are logged too, not just failures — that's what makes
+  spend-per-sneaker analysis possible later (actor calls burned per
+  sneaker over time), not just failure forensics.
+- A run where `written == 0` after a successful actor call and DB write logs
+  `outcome = 'stalled'`.
+- Before inserting this run's row, `refresh_comps.py` reads that sneaker's
+  *immediately preceding* `refresh_runs.outcome`. If it was also `'stalled'`,
+  this run's stall is flagged **consecutive** and printed as a loud,
+  impossible-to-miss warning block in the run summary, distinct from the
+  routine per-sneaker stall line.
 - The run summary always reports a plain count and list of stalled
   sneakers for the run, and a separate, louder section for any that stalled
   on consecutive runs.
@@ -111,6 +113,40 @@ schema:
 This is a detection mechanism only. Seeing the same sneaker in the
 consecutive-stall list repeatedly is the signal to prioritize the Phase 3
 title-to-SKU matching work, not something this job resolves on its own.
+
+## Two audit tables, two grains
+
+`comp_rejections` and `refresh_runs` look similar (both are append-only logs
+keyed on `sneaker_id`) but record different things, and that distinction is
+deliberate, not incidental:
+
+- **`comp_rejections`** — strictly **per-listing**. One row per individual
+  eBay comp that `filter_comp()` rejected, per
+  `docs/comp_filtering_spec.md`'s Auditing section ("log every rejected row
+  with the rule that rejected it"). A count grouped by `rejection_rule` here
+  answers "how often does each filter rule fire." `item_id` and `title` are
+  always populated for a real rejection.
+- **`refresh_runs`** — strictly **per-sneaker-per-attempt**. One row per
+  sneaker per time `refresh_comps.py` attempts it, regardless of outcome. A
+  count grouped by `outcome` here answers "how many refresh attempts
+  succeeded/stalled/errored," a completely different question at a
+  completely different grain (one row per *run*, not per *comp*). Indexed on
+  `(sneaker_id, run_at DESC)`: the consecutive-stall check reads the last
+  row per sneaker on every single attempt, and the table grows by
+  `SNEAKERS_PER_RUN` rows every run, indefinitely — an unindexed lookup would
+  degrade run over run as the table grows.
+
+An earlier version of the stall guard logged `stalled_no_new_rows` markers
+directly into `comp_rejections` with `item_id`/`title` left `NULL`. That was
+reverted: a rule-frequency query against `comp_rejections`
+(`SELECT rejection_rule, COUNT(*) ... GROUP BY rejection_rule`) would have
+silently mixed a once-per-stalled-run marker in with real per-listing
+rejection counts, at a different scale and meaning, with no documented way
+to tell them apart short of checking for `item_id IS NULL`. `refresh_runs`
+exists so that never has to happen — if you're counting rejected listings,
+query `comp_rejections`; if you're auditing refresh attempts or spend, query
+`refresh_runs`. Don't add run-level rows to `comp_rejections`, and don't add
+per-listing rows to `refresh_runs`.
 
 ## Shared code
 
