@@ -63,7 +63,14 @@ from pathlib import Path
 import psycopg2
 from dotenv import load_dotenv
 
-from comp_pipeline import MIN_PRICE_BY_TIER, call_actor, filter_comp, log_rejections, write_comps
+from comp_pipeline import (
+    MIN_PRICE_BY_TIER,
+    call_actor,
+    fetch_remaining_budget_usd,
+    filter_comp,
+    log_rejections,
+    write_comps,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -92,6 +99,12 @@ ESTIMATED_COST_PER_CALL_USD = 0.08
 
 # Matches apify_backfill.py; avoids hammering the actor between calls.
 SLEEP_BETWEEN_CALLS_SECONDS = 2
+
+# Safety margin on the pre-run credit check below: abort before spending
+# anything this run unless remaining Apify budget covers this multiple of
+# the worst-case full-run cost, since ESTIMATED_COST_PER_CALL_USD is itself
+# an estimate and actual per-call cost can vary.
+CREDIT_CHECK_BUFFER = 1.2
 
 # --- End config. ---
 
@@ -264,6 +277,28 @@ def main():
         sys.exit(1)
     if not db_url:
         print("DATABASE_URL not found in .env", file=sys.stderr)
+        sys.exit(1)
+
+    # Pre-run credit check — see docs/refresh_schedule.md, "Known false
+    # positive: mid-run credit exhaustion". Aborts before any actor calls
+    # if remaining monthly budget can't cover this run's worst case, so a
+    # run doesn't get truncated mid-way and log spurious 'stalled' rows.
+    worst_case_cost = SNEAKERS_PER_RUN * ESTIMATED_COST_PER_CALL_USD * CREDIT_CHECK_BUFFER
+    remaining_budget = fetch_remaining_budget_usd(token)
+    if remaining_budget is None:
+        print(
+            "WARNING: could not determine remaining Apify budget (limits API call failed) — "
+            "proceeding without a pre-run credit check.",
+            file=sys.stderr,
+        )
+    elif remaining_budget < worst_case_cost:
+        print(
+            f"Aborting before any actor calls — remaining Apify budget (${remaining_budget:.2f}) "
+            f"is below this run's buffered worst-case cost (${worst_case_cost:.2f} = "
+            f"{SNEAKERS_PER_RUN} x ${ESTIMATED_COST_PER_CALL_USD:.2f} x {CREDIT_CHECK_BUFFER} buffer). "
+            "See docs/refresh_schedule.md, 'Known false positive: mid-run credit exhaustion'.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     conn = psycopg2.connect(db_url)

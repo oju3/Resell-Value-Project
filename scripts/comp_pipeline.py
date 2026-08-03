@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 ACTOR_ID = "caffein.dev~ebay-sold-listings"
 ACTOR_RUN_URL = f"https://api.apify.com/v2/acts/{ACTOR_ID}/run-sync-get-dataset-items"
 ACTOR_RECENT_RUNS_URL = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
+ACCOUNT_LIMITS_URL = "https://api.apify.com/v2/users/me/limits"
 
 # docs/comp_filtering_spec.md, "Scrape parameters"
 MIN_PRICE_BY_TIER = {1: 150, 2: 120, 3: 80}
@@ -105,6 +106,28 @@ def fetch_run_cost(token):
     if (datetime.utcnow() - finished).total_seconds() > 120:
         return None
     return run.get("usageTotalUsd")
+
+
+def fetch_remaining_budget_usd(token):
+    """Best-effort: remaining monthly Apify spend (maxMonthlyUsageUsd minus
+    monthlyUsageUsd) from the account limits endpoint. Returns None if the
+    call fails or the response is missing the expected fields — this API
+    has no stronger reliability guarantee than fetch_run_cost above, so
+    callers must treat None as "unknown," not "zero remaining," and decide
+    for themselves whether to fail open or closed on that ambiguity."""
+    url = ACCOUNT_LIMITS_URL + "?" + urllib.parse.urlencode({"token": token})
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+    try:
+        max_monthly = data["data"]["limits"]["maxMonthlyUsageUsd"]
+        current = data["data"]["current"]["monthlyUsageUsd"]
+    except (KeyError, TypeError):
+        return None
+    return max_monthly - current
 
 
 def extract_size(title):

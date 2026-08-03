@@ -114,6 +114,49 @@ This is a detection mechanism only. Seeing the same sneaker in the
 consecutive-stall list repeatedly is the signal to prioritize the Phase 3
 title-to-SKU matching work, not something this job resolves on its own.
 
+## Known false positive: mid-run credit exhaustion
+
+The stall guard above assumes every logged `raw_returned` reflects a normal,
+uninterrupted actor call. That assumption breaks if the Apify account runs
+out of monthly credit partway through a run: an aborted/truncated call can
+return far fewer items than `COMPS_PER_SNEAKER` requested, and if that
+truncated set happens to already be in `sold_comps`, `write_comps()` still
+reports `written == 0` and the row is logged `outcome = 'stalled'` —
+indistinguishable, from `refresh_runs` alone, from a genuine thin-pool or
+cross-colourway stall.
+
+**Confirmed instance — 2026-08-03 run.** `refresh_runs.raw_returned` across
+that run's 13 calls was `20, 20, 6, 20, 16, 17, 14, 20, 9, 20, 20, 11, 19` —
+dipping well below the requested 20 on several calls rather than holding
+steady, as it does in a normal run. Apify's account notification confirmed
+the $5/month free-tier cap was exceeded partway through this run and
+in-flight actor executions were aborted. Sneaker id 3 (`Jordan 1 High Royal
+Reimagined`) landed on one of the truncated calls (`raw_returned = 6`, all 6
+already in `sold_comps`) and was logged `outcome = 'stalled'`. Investigated
+and ruled out as cross-colourway contamination or a thin sold-listing pool —
+credit exhaustion mid-call is the confirmed cause for this occurrence,
+independent of any per-sneaker data property.
+
+**Implication.** The stall guard, and especially the consecutive-stall
+escalation, cannot currently tell "actor call truncated by hitting the
+spending cap" apart from "actor call completed normally but the keyword
+pool is thin or contaminated." A run that exhausts credit partway through
+can flag several unrelated sneakers as stalled in the same run, and if the
+rotating subset overlaps across weeks, could produce a false
+consecutive-stall warning.
+
+**Fix.** `refresh_comps.py::main()` now checks remaining Apify budget via
+`comp_pipeline.fetch_remaining_budget_usd()`
+(`GET /v2/users/me/limits`) before selecting sneakers or making any actor
+calls. It aborts (exit 1, nothing written to `refresh_runs`) if remaining
+budget is below `SNEAKERS_PER_RUN * ESTIMATED_COST_PER_CALL_USD *
+CREDIT_CHECK_BUFFER` (a 1.2x buffer over the worst-case full-run cost, since
+the per-call estimate is itself approximate). If the limits call fails —
+this account API has no stronger reliability guarantee than the existing
+`fetch_run_cost`, already documented above as unreliable in practice — the
+job fails open: it prints a warning and proceeds without the check, rather
+than blocking the run on a flaky secondary API call.
+
 ## Two audit tables, two grains
 
 `comp_rejections` and `refresh_runs` look similar (both are append-only logs
