@@ -139,6 +139,33 @@ CREATE TABLE comp_rejections (
 );
 CREATE INDEX idx_comp_rejections_sneaker ON comp_rejections (sneaker_id);
 
+-- 11. platform_multipliers: measured eBay -> platform price ratios (separate
+-- from platform_fees: this converts an eBay deadstock median into an
+-- estimated sale price on the target platform; platform_fees then converts
+-- that sale price into a net payout. See docs/platform_multipliers.md.
+CREATE TABLE platform_multipliers (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    platform TEXT NOT NULL,
+    multiplier NUMERIC NOT NULL,
+    band_low NUMERIC,
+    band_high NUMERIC,
+    sample_size INT,
+    method TEXT,
+    confidence TEXT CHECK (confidence IN ('none', 'low', 'medium', 'high')),
+    is_proxy BOOLEAN NOT NULL DEFAULT false,
+    proxy_source TEXT,
+    measured_date DATE NOT NULL,
+    notes TEXT,
+    UNIQUE (platform, measured_date)
+);
+COMMENT ON TABLE platform_multipliers IS
+    'platform_price = ebay_deadstock_median * multiplier; '
+    'net_payout = platform_price * (1 - fee_percent) - fixed_fee (fee_percent/fixed_fee from platform_fees). '
+    'eBay is the numeraire (multiplier = 1.00, confidence = high, is_proxy = false, a definitional '
+    'reference rather than a measurement) -- the multiplier converts an eBay price into an estimated '
+    'price on the target platform, never the reverse. Multiplier and fee are separate stages and must '
+    'not be collapsed into one number.';
+
 -- Row Level Security
 ALTER TABLE sneakers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_history ENABLE ROW LEVEL SECURITY;
@@ -150,6 +177,7 @@ ALTER TABLE lifecycle_curves ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sold_comps ENABLE ROW LEVEL SECURITY;
 ALTER TABLE comp_rejections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE platform_multipliers ENABLE ROW LEVEL SECURITY;
 
 -- Public read on all market/reference data; writes only via service role (bypasses RLS)
 CREATE POLICY "public read" ON sneakers FOR SELECT USING (true);
@@ -161,6 +189,7 @@ CREATE POLICY "public read" ON lifecycle_curves FOR SELECT USING (true);
 CREATE POLICY "public read" ON projections FOR SELECT USING (true);
 CREATE POLICY "public read" ON sold_comps FOR SELECT USING (true);
 CREATE POLICY "public read" ON comp_rejections FOR SELECT USING (true);
+CREATE POLICY "public read" ON platform_multipliers FOR SELECT USING (true);
 
 -- owned_sneakers: users can only touch their own rows
 CREATE POLICY "select own" ON owned_sneakers FOR SELECT USING (auth.uid() = user_id);
