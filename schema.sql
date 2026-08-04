@@ -176,6 +176,17 @@ COMMENT ON TABLE platform_multipliers IS
 -- failure) -- 'ok' rows are what make spend-per-sneaker analysis possible later,
 -- not just failure forensics. Distinct from comp_rejections (per-listing); this
 -- is per-attempt bookkeeping. See docs/refresh_schedule.md.
+--
+-- outcome carries its own cause directly rather than a generic 'stalled' that
+-- would require cross-checking raw_returned/on_conflict_skipped to interpret:
+-- no_listings_found (raw_returned=0), all_filtered (every raw item rejected by
+-- filter_comp), no_new_sales (all accepted rows already in sold_comps under
+-- this SAME sneaker_id -- window overlap, expected), cross_sneaker_conflict
+-- (at least one accepted row already in sold_comps under a DIFFERENT
+-- sneaker_id -- the real contamination signal). Only cross_sneaker_conflict
+-- escalates to the loud consecutive-run warning in refresh_comps.py.
+-- cross_sneaker_skips is supporting detail behind that classification, not
+-- itself the field a reader needs to consult.
 CREATE TABLE refresh_runs (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
@@ -183,7 +194,11 @@ CREATE TABLE refresh_runs (
     raw_returned INT,
     new_rows_inserted INT,
     on_conflict_skipped INT,
-    outcome TEXT NOT NULL CHECK (outcome IN ('ok', 'stalled', 'actor_error', 'db_error'))
+    cross_sneaker_skips INT,
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'ok', 'no_listings_found', 'all_filtered', 'no_new_sales',
+        'cross_sneaker_conflict', 'actor_error', 'db_error'
+    ))
 );
 CREATE INDEX idx_refresh_runs_sneaker_run_at ON refresh_runs (sneaker_id, run_at DESC);
 

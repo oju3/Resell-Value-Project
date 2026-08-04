@@ -28,17 +28,39 @@ this job, including outcome = 'ok' runs, which is what makes spend-per-sneaker
 analysis possible later, not just failure forensics. See
 docs/refresh_schedule.md.
 
-Stall detection: a sneaker whose actor call succeeds but yields zero newly-
-inserted rows (e.g. every returned comp is already in sold_comps under a
-different sneaker_id — see the cross-colourway contamination BLOCKED item in
-docs/comp_filtering_spec.md) never advances its scraped_at, so it can be
-re-selected every run, burning budget without the catalogue rotating
-forward. This job cannot fix that (the underlying keyword-matching issue is
-BLOCKED for Phase 3) but it does detect and surface it: such a run is logged
-to refresh_runs with outcome = 'stalled' and reported in the run summary. If
-the immediately preceding refresh_runs row for that sneaker also has
-outcome = 'stalled', this run's stall is flagged as CONSECUTIVE and printed
-loudly in the summary so it doesn't go unnoticed.
+Zero-write outcomes: a sneaker whose actor call succeeds but yields zero
+newly-inserted rows never advances its scraped_at, so it can be re-selected
+every run, burning budget without the catalogue rotating forward. That much
+is cause-agnostic — but the cause itself is not one thing, and lumping it
+into a single generic 'stalled' outcome (as an earlier version of this job
+did) would repeat the exact mistake refresh_runs was split out of
+comp_rejections to avoid: a reader having to cross-check raw_returned /
+on_conflict_skipped to know what the row actually means. So outcome states
+its own cause directly:
+
+- 'no_listings_found' — raw_returned = 0. The actor found nothing in the
+  30-day window. Nothing to be contaminated by; just a genuinely quiet
+  30 days for that sneaker (see docs/refresh_schedule.md, "Raw-count
+  variation is a velocity signal, not degradation").
+- 'all_filtered' — raw_returned > 0 but every item was rejected by
+  filter_comp (kids listings, bundles, etc.) — filtering working as
+  intended, unrelated to contamination.
+- 'no_new_sales' — every accepted row already existed in sold_comps under
+  this SAME sneaker_id. The 30-day window overlapped a previous scrape;
+  these are the same real sales already on file, not new ones. Expected,
+  not a problem.
+- 'cross_sneaker_conflict' — at least one accepted row already existed in
+  sold_comps under a DIFFERENT sneaker_id (see the cross-colourway
+  contamination BLOCKED item in docs/comp_filtering_spec.md). This is the
+  one that's actually diagnostic of a data-quality problem.
+
+This job cannot fix cross-sneaker conflicts (the underlying keyword-matching
+issue is BLOCKED for Phase 3) but it does detect and surface them. Only
+'cross_sneaker_conflict' triggers the consecutive-run check: if the
+immediately preceding refresh_runs row for that sneaker was also
+'cross_sneaker_conflict', this run is flagged as CONSECUTIVE and printed
+loudly in the summary so it doesn't go unnoticed. The other three zero-write
+outcomes are routine and never escalate.
 
 Does NOT save raw actor responses to data/raw_comps/ — that directory exists
 for the one-time backfill's --from-cache re-filtering replay. This job has
@@ -68,6 +90,7 @@ from comp_pipeline import (
     call_actor,
     fetch_remaining_budget_usd,
     filter_comp,
+    find_existing_owners,
     log_rejections,
     write_comps,
 )
@@ -116,8 +139,8 @@ class Stats:
         self.rows_written = 0
         self.rows_rejected = 0
         self.conflict_skips = 0
-        self.stalled_sneakers = []
-        self.consecutive_stall_sneakers = []
+        self.no_progress_sneakers = []  # (name, outcome) — any zero-write outcome
+        self.consecutive_conflict_sneakers = []  # cross_sneaker_conflict on back-to-back runs
 
 
 def select_sneakers_to_refresh(conn, limit):
@@ -145,7 +168,8 @@ def select_sneakers_to_refresh(conn, limit):
 def fetch_last_outcome(conn, sneaker_id):
     """Most recent refresh_runs.outcome for this sneaker, or None if it's
     never been attempted. Read before this run's row is inserted, so the
-    consecutive-stall check compares against the prior attempt, not itself."""
+    consecutive-cross_sneaker_conflict check compares against the prior
+    attempt, not itself."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -160,15 +184,18 @@ def fetch_last_outcome(conn, sneaker_id):
         return row[0] if row else None
 
 
-def log_run(conn, sneaker_id, raw_returned, new_rows_inserted, on_conflict_skipped, outcome):
+def log_run(conn, sneaker_id, raw_returned, new_rows_inserted, on_conflict_skipped,
+            cross_sneaker_skips, outcome):
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO refresh_runs
-                (sneaker_id, raw_returned, new_rows_inserted, on_conflict_skipped, outcome)
-            VALUES (%s, %s, %s, %s, %s)
+                (sneaker_id, raw_returned, new_rows_inserted, on_conflict_skipped,
+                 cross_sneaker_skips, outcome)
+            VALUES (%s, %s, %s, %s, %s, %s)
             """,
-            (sneaker_id, raw_returned, new_rows_inserted, on_conflict_skipped, outcome),
+            (sneaker_id, raw_returned, new_rows_inserted, on_conflict_skipped,
+             cross_sneaker_skips, outcome),
         )
 
 
@@ -187,7 +214,8 @@ def process_sneaker(conn, token, sneaker, stats):
         time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
 
     # Read before this run's own refresh_runs row is inserted, so the
-    # consecutive-stall check below compares against the prior attempt.
+    # consecutive-cross_sneaker_conflict check below compares against the
+    # prior attempt, not itself.
     prev_outcome = fetch_last_outcome(conn, sneaker_id)
 
     query = f"{name} {style_code}"
@@ -196,7 +224,7 @@ def process_sneaker(conn, token, sneaker, stats):
     except Exception as e:
         print(f"[{name}] ACTOR ERROR — {e}", file=sys.stderr)
         try:
-            log_run(conn, sneaker_id, None, None, None, "actor_error")
+            log_run(conn, sneaker_id, None, None, None, None, "actor_error")
             conn.commit()
         except Exception as log_e:
             conn.rollback()
@@ -221,45 +249,77 @@ def process_sneaker(conn, token, sneaker, stats):
         written, skipped_item_ids = write_comps(conn, sneaker_id, accepted_rows)
         log_rejections(conn, sneaker_id, rejected_items)
         conn.commit()
+        skip_owners = find_existing_owners(conn, skipped_item_ids)
     except Exception as e:
         conn.rollback()
         print(f"[{name}] DB WRITE ERROR — {e}", file=sys.stderr)
         try:
-            log_run(conn, sneaker_id, len(items), None, None, "db_error")
+            log_run(conn, sneaker_id, len(items), None, None, None, "db_error")
             conn.commit()
         except Exception as log_e:
             conn.rollback()
             print(f"[{name}] DB WRITE ERROR (run log) — {log_e}", file=sys.stderr)
         return "db_error"
 
+    cross_sneaker_skips = sum(
+        1 for item_id in skipped_item_ids
+        if skip_owners.get(item_id) is not None and skip_owners[item_id] != sneaker_id
+    )
+
     print(
         f"[{name}] tier={hype_tier} raw={len(items)} new_inserted={written} "
-        f"on_conflict_skipped={len(skipped_item_ids)}"
+        f"on_conflict_skipped={len(skipped_item_ids)} cross_sneaker_skips={cross_sneaker_skips}"
     )
     for rule, n in sorted(rejections_by_rule.items()):
         print(f"    rejected[{rule}]: {n}")
 
-    run_outcome = "stalled" if written == 0 else "ok"
+    if written > 0:
+        run_outcome = "ok"
+    elif len(items) == 0:
+        run_outcome = "no_listings_found"
+    elif len(accepted_rows) == 0:
+        run_outcome = "all_filtered"
+    elif cross_sneaker_skips > 0:
+        run_outcome = "cross_sneaker_conflict"
+    else:
+        run_outcome = "no_new_sales"
+
     try:
-        log_run(conn, sneaker_id, len(items), written, len(skipped_item_ids), run_outcome)
+        log_run(conn, sneaker_id, len(items), written, len(skipped_item_ids),
+                cross_sneaker_skips, run_outcome)
         conn.commit()
     except Exception as e:
         conn.rollback()
         print(f"[{name}] DB WRITE ERROR (run log) — {e}", file=sys.stderr)
 
-    if run_outcome == "stalled":
-        consecutive = prev_outcome == "stalled"
-        stats.stalled_sneakers.append(name)
-        if consecutive:
-            stats.consecutive_stall_sneakers.append(name)
-            print(
-                f"    !!! CONSECUTIVE STALL — {name} has produced zero new rows on back-to-back "
-                f"attempts. Likely cross-colourway contamination (docs/comp_filtering_spec.md, "
-                f"'Cross-colourway keyword contamination — BLOCKED'). Investigate before it burns "
-                f"further budget. !!!"
-            )
-        else:
-            print(f"    STALLED — 0 new rows this run (raw={len(items)}); logged to refresh_runs")
+    if run_outcome != "ok":
+        stats.no_progress_sneakers.append((name, run_outcome))
+
+        if run_outcome == "cross_sneaker_conflict":
+            consecutive = prev_outcome == "cross_sneaker_conflict"
+            if consecutive:
+                stats.consecutive_conflict_sneakers.append(name)
+                print(
+                    f"    !!! CONSECUTIVE CROSS-SNEAKER CONFLICT — {name} has had comps already "
+                    f"claimed by a different sneaker_id on back-to-back attempts. Likely "
+                    f"cross-colourway contamination (docs/comp_filtering_spec.md, "
+                    f"'Cross-colourway keyword contamination — BLOCKED'). Investigate before it "
+                    f"burns further budget. !!!"
+                )
+            else:
+                print(
+                    f"    CROSS_SNEAKER_CONFLICT — {cross_sneaker_skips} of {len(skipped_item_ids)} "
+                    f"skipped comp(s) already claimed by a different sneaker; logged to refresh_runs"
+                )
+        elif run_outcome == "no_listings_found":
+            print(f"    NO_LISTINGS_FOUND — actor returned 0 comps in the {DAYS_TO_SCRAPE}-day "
+                  f"window; expected for low-velocity inventory, not a data issue")
+        elif run_outcome == "all_filtered":
+            print(f"    ALL_FILTERED — raw={len(items)} but every item was rejected by filter_comp "
+                  f"(kids/bundle noise); no comps to write, not a stall")
+        elif run_outcome == "no_new_sales":
+            print(f"    NO_NEW_SALES — {len(skipped_item_ids)} comp(s) already on file under this "
+                  f"same sneaker (window overlap); no new sales this run, expected")
 
     stats.rows_written += written
     stats.rows_rejected += len(rejected_items)
@@ -282,7 +342,7 @@ def main():
     # Pre-run credit check — see docs/refresh_schedule.md, "Known false
     # positive: mid-run credit exhaustion". Aborts before any actor calls
     # if remaining monthly budget can't cover this run's worst case, so a
-    # run doesn't get truncated mid-way and log spurious 'stalled' rows.
+    # run doesn't get truncated mid-way and log spurious zero-write outcomes.
     worst_case_cost = SNEAKERS_PER_RUN * ESTIMATED_COST_PER_CALL_USD * CREDIT_CHECK_BUFFER
     remaining_budget = fetch_remaining_budget_usd(token)
     if remaining_budget is None:
@@ -325,13 +385,13 @@ def main():
     print(f"Rows rejected: {stats.rows_rejected}")
     print(f"ON CONFLICT skips: {stats.conflict_skips}")
     print(f"Estimated cost: ${estimated_cost:.2f} ({stats.actor_calls} calls x ${ESTIMATED_COST_PER_CALL_USD:.2f}/call, estimate only)")
-    print(f"Sneakers stalled (0 new rows): {len(stats.stalled_sneakers)}")
-    if stats.stalled_sneakers:
-        for name in stats.stalled_sneakers:
-            print(f"  - {name}")
-    if stats.consecutive_stall_sneakers:
-        print(f"\n!!! {len(stats.consecutive_stall_sneakers)} sneaker(s) stalled on CONSECUTIVE runs — see warnings above !!!")
-        for name in stats.consecutive_stall_sneakers:
+    print(f"Sneakers with no new rows this run: {len(stats.no_progress_sneakers)}")
+    if stats.no_progress_sneakers:
+        for name, outcome in stats.no_progress_sneakers:
+            print(f"  - {name} ({outcome})")
+    if stats.consecutive_conflict_sneakers:
+        print(f"\n!!! {len(stats.consecutive_conflict_sneakers)} sneaker(s) had CONSECUTIVE cross_sneaker_conflict — see warnings above !!!")
+        for name in stats.consecutive_conflict_sneakers:
             print(f"  - {name}")
 
     conn.close()

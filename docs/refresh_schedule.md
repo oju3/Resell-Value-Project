@@ -72,58 +72,149 @@ finer granularity), move to daily by editing constants in
 - The cron schedule itself (day-of-week -> daily) is set wherever the job is
   scheduled on Railway, not in this file.
 
-## Stalled-sneaker guard
+## Raw-count variation is a velocity signal, not degradation
+
+`refresh_runs.raw_returned` varies run to run — sometimes the full
+`COMPS_PER_SNEAKER = 20`, sometimes single digits, occasionally 0. Read in
+isolation this can look like something is wrong (a thinning pool, actor
+degradation, contamination eating into results). It isn't. Every Apify run
+behind this data succeeded with zero actor failures — the variation is fully
+explained by two things that have nothing to do with data quality:
+
+1. **`daysToScrape` differs by design.** The backfill (`apify_backfill.py`)
+   scrapes a 90-day window and consistently returns the full 20 requested.
+   The refresh job scrapes only `DAYS_TO_SCRAPE = 30` days (see "Purpose"
+   above — this tops up recent sales, it does not rebuild history). A
+   90-day window naturally has ~3x the sold-listing pool of a 30-day window
+   for the same sneaker, so a lower raw count in the refresh job than in the
+   backfill is expected on that basis alone, not a regression.
+2. **Genuine sold volume varies by shoe.** Within a fixed 30-day window,
+   different sneakers have different real sales velocity — a tier-1 hype
+   release and a tier-3 slow mover do not sell at the same pace. A raw count
+   of 3 for a low-volume sneaker in a 30-day window is not a fault to
+   investigate; it's the actual sales-velocity signal for that sneaker. Only
+   a raw count of exactly 0 combined with the same sneaker doing so
+   *repeatedly* would be worth a second look (e.g. as a query-matching
+   problem), and even then the fix is a query/keyword change, not a filter
+   or contamination fix.
+
+Concretely: `refresh_runs.outcome = 'no_listings_found'` (see below) means
+"nothing sold in the last 30 days for this sneaker," full stop. It does not
+imply a stall, a fault, or contamination — see sneaker id 19 (Jordan 4 Red
+Thunder), which logged `raw_returned = 0` with zero actor errors anywhere in
+the run.
+
+## Zero-write outcomes
 
 A sneaker whose actor call succeeds but yields **zero newly-inserted rows**
-never advances its `scraped_at`. The most likely cause is the cross-colourway
-keyword contamination already logged as BLOCKED in
-`docs/comp_filtering_spec.md`: every comp the actor returns for that sneaker
-this run was already written to `sold_comps` under a *different* sneaker_id
-(first-write-wins on `item_id`), so `write_comps()` reports zero new rows
-even though the actor call succeeded and cost money.
-
-Because staleness drives selection, a sneaker stuck like this doesn't just
-sit there quietly — it becomes one of the *stalest* sneakers in the catalogue
-and gets re-selected on (or near) the very next run, repeating the same
+never advances its `scraped_at`. That much is cause-agnostic: because
+staleness drives selection, a sneaker stuck like this doesn't just sit there
+quietly, it becomes one of the *stalest* sneakers in the catalogue and gets
+re-selected on (or near) the very next run, repeating the same
 zero-progress, non-zero-cost cycle indefinitely and starving other sneakers
 of their rotation slot.
 
-This job does not fix that (the underlying title-to-SKU matching problem is
-explicitly deferred to Phase 3). It only detects and surfaces it, using the
-dedicated `refresh_runs` table (see "Two audit tables, two grains" below) —
-not `comp_rejections`, which stays strictly per-listing:
+But the *cause* of a zero-write run is not one thing, and an earlier version
+of this guard collapsed all of them into a single generic `outcome =
+'stalled'` with a write-up that named cross-colourway contamination as the
+"most likely cause." That was wrong more often than not: of the 4 zero-write
+runs logged under the old scheme, one (`raw_returned = 0`, sneaker 19) had
+nothing to be contaminated by, and the other three all matched more cleanly
+to routine window overlap once their `on_conflict_skipped` rows were traced
+to their owning `sneaker_id` (see `scripts/migrate_refresh_runs_outcomes.py`
+for the reclassification). Naming a single ambiguous value also reproduced
+the exact problem `refresh_runs` was split out of `comp_rejections` to
+avoid — a reader having to cross-check other columns to know what a row
+means (see "Two audit tables, two grains" below).
 
-- Every attempt writes a `refresh_runs` row: `sneaker_id`, `run_at`,
-  `raw_returned`, `new_rows_inserted`, `on_conflict_skipped`, and an
-  `outcome` of `'ok'`, `'stalled'`, `'actor_error'`, or `'db_error'`.
-  `'ok'` rows are logged too, not just failures — that's what makes
-  spend-per-sneaker analysis possible later (actor calls burned per
-  sneaker over time), not just failure forensics.
-- A run where `written == 0` after a successful actor call and DB write logs
-  `outcome = 'stalled'`.
-- Before inserting this run's row, `refresh_comps.py` reads that sneaker's
-  *immediately preceding* `refresh_runs.outcome`. If it was also `'stalled'`,
-  this run's stall is flagged **consecutive** and printed as a loud,
-  impossible-to-miss warning block in the run summary, distinct from the
-  routine per-sneaker stall line.
-- The run summary always reports a plain count and list of stalled
-  sneakers for the run, and a separate, louder section for any that stalled
-  on consecutive runs.
+`outcome` now states its own cause directly, using
+`comp_pipeline.find_existing_owners()` (already used by `apify_backfill.py`
+for the same purpose, but previously never wired into `refresh_comps.py`)
+to check whether each `ON CONFLICT`-skipped item belongs to this sneaker or
+a different one:
 
-This is a detection mechanism only. Seeing the same sneaker in the
-consecutive-stall list repeatedly is the signal to prioritize the Phase 3
-title-to-SKU matching work, not something this job resolves on its own.
+- **`'ok'`** — `written > 0`. Normal case, logged for every attempt (not just
+  failures) so spend-per-sneaker analysis is possible later.
+- **`'no_listings_found'`** — `raw_returned = 0`. Nothing sold in the
+  30-day window. See "Raw-count variation" above — this is a velocity
+  reading, not a fault.
+- **`'all_filtered'`** — `raw_returned > 0` but every returned item was
+  rejected by `filter_comp` (kids listings, bundles, etc.). Filtering
+  working as intended; unrelated to contamination.
+- **`'no_new_sales'`** — every accepted row's `item_id` was already in
+  `sold_comps` under this **same** `sneaker_id`. The 30-day window overlapped
+  a previous scrape; these are the same real sales already on file, not new
+  ones. Expected on a rotation whose cadence can outrun a slow seller's
+  actual turnover.
+- **`'cross_sneaker_conflict'`** — at least one accepted row's `item_id` was
+  already in `sold_comps` under a **different** `sneaker_id`. This is the
+  one outcome that's actually diagnostic of the cross-colourway keyword
+  contamination logged as BLOCKED in `docs/comp_filtering_spec.md`.
+- **`'actor_error'` / `'db_error'`** — unchanged from before.
+
+`cross_sneaker_skips` (an `INT` column alongside `outcome`) records how many
+of the run's `on_conflict_skipped` rows were owned by a different
+`sneaker_id` — supporting detail behind the `cross_sneaker_conflict`
+classification, not something a reader needs to consult to know what
+`outcome` means. It's `NULL` (not `0`) for any row logged before this column
+existed, since per-run item_ids weren't retained and the distinction can't
+be reconstructed retroactively for those rows.
+
+Only `'cross_sneaker_conflict'` escalates: before inserting this run's row,
+`refresh_comps.py` reads that sneaker's *immediately preceding*
+`refresh_runs.outcome`. If it was also `'cross_sneaker_conflict'`, this run
+is flagged **consecutive** and printed as a loud, impossible-to-miss warning
+block in the run summary. The other three zero-write outcomes print a
+routine, non-alarming line and never escalate — repeated
+`'no_listings_found'` or `'no_new_sales'` for the same sneaker is just a
+persistently low-velocity shoe, not something to investigate.
+
+This job does not fix cross-sneaker conflicts (the underlying title-to-SKU
+matching problem is explicitly deferred to Phase 3). It only detects and
+surfaces them. Seeing the same sneaker in the consecutive-conflict list
+repeatedly is the signal to prioritize that work, not something this job
+resolves on its own.
+
+## Should `raw_returned` feed `sales_velocity`?
+
+No — `sales_velocity.sales_per_week` should be derived from `sold_comps.
+ended_at` directly, not from `refresh_runs.raw_returned`. Three reasons
+`raw_returned` is the wrong input:
+
+1. **It's capped.** `COMPS_PER_SNEAKER = 20` means a sneaker actually selling
+   40 pairs in 30 days and one selling 20 both report `raw_returned` at or
+   near 20 — the cap hides real velocity differences above it.
+2. **It includes pre-filter noise.** `raw_returned` counts everything the
+   actor returned before `filter_comp` runs — kids listings, bundles, etc.
+   included. `sold_comps` holds only what survived filtering, which is the
+   more accurate count of real, attributable sales.
+3. **It's a point-sample from an irregular, overlapping window.** Runs land
+   on a rotating ~4-week cadence with a 30-day lookback, so consecutive
+   `raw_returned` values for the same sneaker overlap in what they're
+   counting rather than forming a clean non-overlapping rate.
+
+`sold_comps.ended_at` doesn't have these problems: it's the filtered ground
+truth, unbounded by the per-call cap, and a query like `COUNT(*) WHERE
+ended_at > now() - interval '90 days'` divided by `90/7.0` gives a real rate
+over a clean, explicit window. That should be its own small scheduled
+aggregation step — consistent with this repo's existing pattern of one
+table per concern (`comp_rejections` vs `refresh_runs`) — not folded into
+`refresh_comps.py` itself. `raw_returned` may still be useful as a cheap
+secondary signal for *scheduling* (e.g. deprioritizing sneakers with a
+history of low raw counts to save budget), but that's a rotation
+optimization, not the source of truth for `sales_velocity`.
 
 ## Known false positive: mid-run credit exhaustion
 
-The stall guard above assumes every logged `raw_returned` reflects a normal,
-uninterrupted actor call. That assumption breaks if the Apify account runs
-out of monthly credit partway through a run: an aborted/truncated call can
-return far fewer items than `COMPS_PER_SNEAKER` requested, and if that
-truncated set happens to already be in `sold_comps`, `write_comps()` still
-reports `written == 0` and the row is logged `outcome = 'stalled'` —
-indistinguishable, from `refresh_runs` alone, from a genuine thin-pool or
-cross-colourway stall.
+The zero-write outcomes above assume every logged `raw_returned` reflects a
+normal, uninterrupted actor call. That assumption breaks if the Apify
+account runs out of monthly credit partway through a run: an
+aborted/truncated call can return far fewer items than `COMPS_PER_SNEAKER`
+requested, and if that truncated set happens to already be in `sold_comps`,
+`write_comps()` still reports `written == 0` — indistinguishable, from
+`raw_returned` alone, from a genuine thin sold-listing pool (see "Raw-count
+variation" above, which explains why a low `raw_returned` is normally *not*
+a problem worth flagging on its own).
 
 **Confirmed instance — 2026-08-03 run.** `refresh_runs.raw_returned` across
 that run's 13 calls was `20, 20, 6, 20, 16, 17, 14, 20, 9, 20, 20, 11, 19` —
@@ -132,18 +223,21 @@ steady, as it does in a normal run. Apify's account notification confirmed
 the $5/month free-tier cap was exceeded partway through this run and
 in-flight actor executions were aborted. Sneaker id 3 (`Jordan 1 High Royal
 Reimagined`) landed on one of the truncated calls (`raw_returned = 6`, all 6
-already in `sold_comps`) and was logged `outcome = 'stalled'`. Investigated
-and ruled out as cross-colourway contamination or a thin sold-listing pool —
-credit exhaustion mid-call is the confirmed cause for this occurrence,
-independent of any per-sneaker data property.
+already in `sold_comps` under sneaker id 3 itself) — under the current
+scheme this logs `outcome = 'no_new_sales'`, not `'cross_sneaker_conflict'`,
+which is the correct classification: investigated and ruled out as
+cross-colourway contamination or a thin sold-listing pool — credit
+exhaustion mid-call is the confirmed cause for this occurrence, independent
+of any per-sneaker data property.
 
-**Implication.** The stall guard, and especially the consecutive-stall
-escalation, cannot currently tell "actor call truncated by hitting the
-spending cap" apart from "actor call completed normally but the keyword
-pool is thin or contaminated." A run that exhausts credit partway through
-can flag several unrelated sneakers as stalled in the same run, and if the
-rotating subset overlaps across weeks, could produce a false
-consecutive-stall warning.
+**Implication.** Truncated calls from mid-run credit exhaustion land in the
+same non-escalating buckets (`'no_new_sales'` / `'all_filtered'` /
+`'no_listings_found'`) as genuine low-velocity sneakers, which is the
+correct behavior now that only `'cross_sneaker_conflict'` escalates — a
+truncated call has no reason to produce a cross-sneaker match, so this
+failure mode can no longer trigger a false consecutive-conflict warning the
+way it could under the old single-`'stalled'` scheme. The pre-run credit
+check below remains the primary defense against the truncation itself.
 
 **Fix.** `refresh_comps.py::main()` now checks remaining Apify budget via
 `comp_pipeline.fetch_remaining_budget_usd()`
@@ -172,10 +266,12 @@ deliberate, not incidental:
 - **`refresh_runs`** — strictly **per-sneaker-per-attempt**. One row per
   sneaker per time `refresh_comps.py` attempts it, regardless of outcome. A
   count grouped by `outcome` here answers "how many refresh attempts
-  succeeded/stalled/errored," a completely different question at a
-  completely different grain (one row per *run*, not per *comp*). Indexed on
-  `(sneaker_id, run_at DESC)`: the consecutive-stall check reads the last
-  row per sneaker on every single attempt, and the table grows by
+  succeeded, found nothing, got filtered out, overlapped a prior scrape,
+  hit a cross-sneaker conflict, or errored," a completely different question
+  at a completely different grain (one row per *run*, not per *comp*).
+  Indexed on `(sneaker_id, run_at DESC)`: the consecutive-cross_sneaker_conflict
+  check reads the last row per sneaker on every single attempt, and the
+  table grows by
   `SNEAKERS_PER_RUN` rows every run, indefinitely — an unindexed lookup would
   degrade run over run as the table grows.
 
