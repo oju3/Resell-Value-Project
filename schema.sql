@@ -1,6 +1,19 @@
 -- Sneaker resale valuation app: core schema
 -- 10 tables + RLS. See CLAUDE.md for project context.
 
+-- Required extensions
+-- pg_trgm powers the fuzzy fallback stage of GET /sneakers/search (see
+-- app/sneakers.py). Without it the substring stage still works, but any search
+-- that finds nothing raises "function word_similarity does not exist" instead
+-- of recovering from the typo -- a failure that only shows up on the zero-hit
+-- path, which is exactly the path least likely to be exercised by hand. It is
+-- declared here so a fresh install cannot silently lose it.
+--
+-- Installed into the `extensions` schema, matching the convention this project
+-- already uses for pgcrypto and uuid-ossp. `extensions` is on the default
+-- search_path, so word_similarity() resolves without qualification.
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
+
 -- 1. sneakers: master catalog
 CREATE TABLE sneakers (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

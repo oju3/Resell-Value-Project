@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.db import close_pool, init_pool
-from app.routers import health, me, valuation
+from app.routers import health, me, sneakers, valuation
 
 logging.basicConfig(level=logging.INFO)
 
@@ -44,4 +44,5 @@ app = FastAPI(
 # adding a Phase 3 resource means adding one file plus one line.
 app.include_router(health.router)
 app.include_router(me.router)
+app.include_router(sneakers.router)
 app.include_router(valuation.router)
