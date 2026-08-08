@@ -59,7 +59,7 @@ Exclusion matching uses word-boundary regex, not substring — matching by subst
 
 - `conditionId` 1000 maps to the deadstock baseline.
 - `conditionId` 1500 is persisted but excluded from the baseline.
-  *— baseline anchors all six derived tiers; contaminating it propagates error everywhere*
+  *— the baseline is the valuation figure the product actually reports; contaminating it with New Other listings biases every number downstream*
 - `conditionId` 3000 is excluded from valuation entirely. It previously mapped to the used tiers, which the MVP no longer values (`docs/scope_deadstock_only.md`). It is a non-issue in practice regardless: `apify_backfill.py` sends `itemCondition: "new"`, so `sold_comps` holds zero rows at 3000. Any that slip through are persisted and ignored, not dropped — keeping the raw `conditionId` is what lets used valuation return in v1.1 without re-scraping.
 
 ### Aggregation
