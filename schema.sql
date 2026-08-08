@@ -49,18 +49,43 @@ CREATE TABLE sales_velocity (
     UNIQUE (sneaker_id, size)
 );
 
--- 4. owned_sneakers: user collections / brokerage account
+-- 4. owned_sneakers: pairs a user currently owns (UNSOLD only)
+-- Sold pairs are MOVED to sold_sneakers (table 13) and deleted from here, so
+-- "what I own" and "what I sold" stay two clean queries with no status filter.
+--
+-- A user may own several of the same sneaker in different sizes or at
+-- different prices, so there is deliberately no UNIQUE (user_id, sneaker_id).
+--
+-- Authorization note: RLS below is defence-in-depth only. The API reaches this
+-- table over psycopg2, where auth.uid() is NULL -- every query must carry an
+-- explicit WHERE user_id = %s. See app/db.py::get_conn.
 CREATE TABLE owned_sneakers (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES auth.users(id),
     sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
     size TEXT,
+    -- UNUSED in v1: the MVP is deadstock-only, so every pair is deadstock by
+    -- definition. Kept, not dropped -- see docs/scope_deadstock_only.md.
     condition TEXT,
+    -- UNUSED in v1: not part of what the add-pair flow records.
     has_box BOOLEAN,
     has_receipt BOOLEAN,
     defects TEXT,
     purchase_price NUMERIC,
     purchase_date DATE,
+    -- Fixed vocabulary, lowercase slugs. Lowercase matches
+    -- platform_fees.platform, which sold_sneakers.sale_platform must equal
+    -- exactly for the banded fee lookup to return a row; one casing
+    -- convention across adjacent columns avoids a silent zero-row lookup.
+    -- CHECK rather than an enum: widening the list is a one-line swap.
+    purchase_source TEXT CHECK (purchase_source IN
+        ('snkrs', 'stockx', 'goat', 'ebay', 'in_store', 'other')),
+    -- UNUSED BELOW THIS LINE. Superseded by sold_sneakers (table 13).
+    -- NOTHING READS `status`, including this default: a sold pair is removed
+    -- from this table entirely rather than flipped to 'sold', so no query
+    -- filters on it. A default that is never checked is easy to mistake for
+    -- load-bearing state -- it is not. Retained rather than dropped because
+    -- dropping is destructive for no functional gain.
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'sold')),
     sale_platform TEXT,
     sale_price NUMERIC,
@@ -223,6 +248,42 @@ CREATE TABLE refresh_runs (
 );
 CREATE INDEX idx_refresh_runs_sneaker_run_at ON refresh_runs (sneaker_id, run_at DESC);
 
+-- 13. sold_sneakers: historical record of pairs a user has sold.
+-- A row here is a HISTORICAL FACT and must stay correct forever, so it does
+-- not depend on any value that can change later:
+--
+--   * purchase_price/date/source are COPIED from owned_sneakers, because the
+--     source row is deleted by the same transaction that writes this one.
+--   * fee_percent_applied, fixed_fee_applied, fee_amount and realized_pl are
+--     FROZEN at sale time rather than derived on read. platform_fees is
+--     mutable and this repo has already reseeded it twice (d8370e7, b356de4);
+--     recomputing would retroactively change what a past sale earned.
+--   * sneaker_id stays a FOREIGN KEY rather than a copied name. Catalogue
+--     identity is stable and it is the same shoe. Tradeoff, stated plainly:
+--     renaming a sneaker re-renders past sales under the new name. Accepted
+--     as correct; copy the name instead if history must be literally frozen.
+--
+-- realized_pl = sale_price - fee_amount - purchase_price. See app/portfolio.py
+-- for the banded fee lookup, including the $150 boundary.
+CREATE TABLE sold_sneakers (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id),
+    sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
+    size TEXT,
+    purchase_price NUMERIC NOT NULL,
+    purchase_date DATE,
+    purchase_source TEXT,
+    sale_price NUMERIC NOT NULL,
+    sale_platform TEXT NOT NULL CHECK (sale_platform IN ('ebay', 'stockx', 'goat')),
+    sale_date DATE NOT NULL,
+    fee_percent_applied NUMERIC NOT NULL,
+    fixed_fee_applied NUMERIC NOT NULL,
+    fee_amount NUMERIC NOT NULL,
+    realized_pl NUMERIC NOT NULL,
+    sold_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_sold_sneakers_user_id ON sold_sneakers (user_id);
+
 -- Row Level Security
 ALTER TABLE sneakers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_history ENABLE ROW LEVEL SECURITY;
@@ -236,6 +297,7 @@ ALTER TABLE sold_comps ENABLE ROW LEVEL SECURITY;
 ALTER TABLE comp_rejections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE platform_multipliers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE refresh_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sold_sneakers ENABLE ROW LEVEL SECURITY;
 
 -- Public read on all market/reference data; writes only via service role (bypasses RLS)
 CREATE POLICY "public read" ON sneakers FOR SELECT USING (true);
@@ -255,3 +317,9 @@ CREATE POLICY "select own" ON owned_sneakers FOR SELECT USING (auth.uid() = user
 CREATE POLICY "insert own" ON owned_sneakers FOR INSERT WITH CHECK (auth.uid() = user_id);
 CREATE POLICY "update own" ON owned_sneakers FOR UPDATE USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 CREATE POLICY "delete own" ON owned_sneakers FOR DELETE USING (auth.uid() = user_id);
+
+-- sold_sneakers: same per-user scoping as owned_sneakers
+CREATE POLICY "select own" ON sold_sneakers FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "insert own" ON sold_sneakers FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "update own" ON sold_sneakers FOR UPDATE USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "delete own" ON sold_sneakers FOR DELETE USING (auth.uid() = user_id);

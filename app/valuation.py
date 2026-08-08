@@ -210,6 +210,96 @@ ORDER BY comp_count DESC;
 """
 
 
+# Batched headline value for many sneakers at once, used by the portfolio list
+# so that showing N pairs costs ONE query instead of N x 3.
+#
+# WHY THIS DUPLICATES THE FENCE LOGIC IN _FENCE_CTE ABOVE
+# -------------------------------------------------------
+# The obvious move is to make _FENCE_CTE group-aware and share it. It does not
+# work, for a specific reason worth keeping: get_valuation depends on ungrouped
+# aggregates returning exactly ONE row even over zero comps (NULL medians,
+# COUNT 0). That property is what makes `fetchone() is None` a reliable 404
+# check and what produces the null-metric zero-comp response. Add
+# GROUP BY sneaker_id and a sneaker with no comps returns NO row at all, and
+# both behaviours collapse.
+#
+# So the two forms genuinely cannot be one query. The fence maths below must
+# stay identical to _FENCE_CTE -- change one, change the other.
+#
+# Deliberately narrower than get_valuation: headline value and comp counts
+# only, no trend, size breakdown or listing types. The list view does not
+# display them, and per-pair detail is the valuation endpoint's job.
+_BATCH_VALUES_SQL = """
+WITH deadstock AS (
+    SELECT sneaker_id, sold_price
+    FROM sold_comps
+    WHERE condition_id = %(deadstock_condition_id)s
+      AND sneaker_id = ANY(%(sneaker_ids)s)
+),
+bounds AS (
+    SELECT sneaker_id,
+           percentile_cont(0.25) WITHIN GROUP (ORDER BY sold_price) AS q1,
+           percentile_cont(0.75) WITHIN GROUP (ORDER BY sold_price) AS q3,
+           COUNT(*) AS comp_count_raw
+    FROM deadstock
+    GROUP BY sneaker_id
+),
+fence AS (
+    SELECT sneaker_id, comp_count_raw,
+           q1 - 1.5 * (q3 - q1) AS lower_fence,
+           q3 + 1.5 * (q3 - q1) AS upper_fence
+    FROM bounds
+),
+kept AS (
+    SELECT d.sneaker_id, d.sold_price
+    FROM deadstock d
+    JOIN fence f ON f.sneaker_id = d.sneaker_id
+    WHERE d.sold_price BETWEEN f.lower_fence AND f.upper_fence
+)
+SELECT k.sneaker_id,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY k.sold_price) AS value,
+       COUNT(*) AS comp_count_used,
+       MAX(f.comp_count_raw) AS comp_count_raw
+FROM kept k
+JOIN fence f ON f.sneaker_id = k.sneaker_id
+GROUP BY k.sneaker_id;
+"""
+
+
+def get_values_for_sneakers(conn, sneaker_ids) -> dict:
+    """Headline deadstock value for many sneakers in one query.
+
+    Returns {sneaker_id: {"value", "comp_count_raw", "comp_count_used",
+    "low_confidence"}}. A sneaker with no comps is simply ABSENT from the
+    result -- callers must treat a missing key as "no valuation available"
+    rather than as zero. Verified to match get_valuation exactly across the
+    catalogue.
+    """
+    ids = list({int(i) for i in sneaker_ids})
+    if not ids:
+        return {}
+
+    with conn.cursor() as cur:
+        cur.execute(
+            _BATCH_VALUES_SQL,
+            {
+                "deadstock_condition_id": DEADSTOCK_CONDITION_ID,
+                "sneaker_ids": ids,
+            },
+        )
+        rows = cur.fetchall()
+
+    return {
+        sneaker_id: {
+            "value": _round(value, PRICE_DP),
+            "comp_count_used": comp_count_used,
+            "comp_count_raw": comp_count_raw,
+            "low_confidence": comp_count_used < LOW_CONFIDENCE_MIN_COMPS,
+        }
+        for sneaker_id, value, comp_count_used, comp_count_raw in rows
+    }
+
+
 def _round(value: Optional[float], places: int) -> Optional[float]:
     """round() that passes None through, so every "no data" path stays null
     instead of raising."""
