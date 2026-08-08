@@ -74,6 +74,14 @@ CREATE TABLE platform_fees (
 );
 
 -- 6. condition_multipliers: value retention by wear level
+-- UNUSED IN v1, AND THE SEEDED VALUES ARE ASSUMED RATHER THAN MEASURED.
+-- The MVP values deadstock/new sneakers only (docs/scope_deadstock_only.md),
+-- so nothing reads this table; deadstock is the 1.00 identity row. The six
+-- seeded multipliers have no documented derivation and cannot be validated
+-- from the current feed -- eBay exposes three conditionId values, so five of
+-- the six tiers collapse into 3000, and sold_comps holds zero rows there.
+-- Kept, not dropped: used valuation returns in v1.1, and it needs measured
+-- multipliers plus a data source that actually reports used sold prices.
 CREATE TABLE condition_multipliers (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     condition TEXT NOT NULL UNIQUE,

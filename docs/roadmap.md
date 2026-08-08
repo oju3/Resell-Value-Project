@@ -21,9 +21,11 @@ API. See `docs/comp_filtering_spec.md`, `docs/platform_multipliers.md`,
 ## Phase 3 — Backend core (next)
 
 Auth via Supabase, search and sneaker detail endpoints, portfolio CRUD with
-mark-as-sold and realized P/L, valuation engine (condition multiplier plus
-uncertainty), recommendation engine (eligibility → fees → net payout → three
-picks plus time-to-sell), per-size profitability and stats endpoints.
+mark-as-sold and realized P/L, valuation engine (deadstock median plus
+uncertainty — no condition multiplier applied, see
+`docs/scope_deadstock_only.md`), recommendation engine (eligibility → fees →
+net payout → three picks plus time-to-sell), per-size profitability and stats
+endpoints.
 
 ## Phase 3.5 — Projection engine
 
@@ -34,10 +36,11 @@ comps model using `lifecycle_curves`.
 ## Phase 4 — Frontend
 
 Login/signup with protected routes, search and sneaker page (projection
-cone chart, size grid, best size), add-pair flow (size, condition,
-box/receipt, price, date), portfolio dashboard (P/L, charts, HOLD/SELL
-summary), Where to Sell panel (three picks, table, greyed-out ineligible),
-mark-as-sold and sales history.
+cone chart, size grid, best size), add-pair flow (size, box/receipt, price,
+date — no condition input; v1 pairs are deadstock by definition), portfolio
+dashboard (P/L, charts, HOLD/SELL summary), Where to Sell panel (three picks,
+table — nothing is greyed out in v1, since deadstock clears every platform's
+`min_condition` gate), mark-as-sold and sales history.
 
 ## Phase 5 — Launch — target August 31
 
@@ -51,3 +54,8 @@ this order: per-size profitability endpoints, the comps model and
 `lifecycle_curves`, and the technical model (leaving Monte Carlo alone as
 the projection basis). Rationale: each is additive to the core valuation and
 recommendation loop rather than load-bearing for it.
+
+Already deferred to v1.1: used-condition valuation. The MVP values
+deadstock/new only. This was a scope decision rather than a schedule cut —
+the seeded multipliers are assumptions that the current data source cannot
+validate. See `docs/scope_deadstock_only.md`.

@@ -1,6 +1,6 @@
 ## Purpose
 
-This document defines the rules for cleaning raw eBay sold-listing comps — scraped via the caffein.dev/ebay-sold-listings Apify actor — before they're written into `price_history`. `condition_multipliers` anchors all six condition tiers on a single deadstock baseline (multiplier = 1.00), so these rules exist to keep that baseline, and the comp stream feeding it, free of non-representative or duplicate data points.
+This document defines the rules for cleaning raw eBay sold-listing comps — scraped via the caffein.dev/ebay-sold-listings Apify actor — before they're written into `price_history`. The deadstock baseline (`conditionId` 1000) is what the product values, so these rules exist to keep that baseline, and the comp stream feeding it, free of non-representative or duplicate data points. The baseline was previously described here as the anchor for all six `condition_multipliers` tiers; the MVP values deadstock only and those derived tiers have no consumer — see `docs/scope_deadstock_only.md`. The filtering rules below are unaffected either way.
 
 ## Data source
 
@@ -60,7 +60,7 @@ Exclusion matching uses word-boundary regex, not substring — matching by subst
 - `conditionId` 1000 maps to the deadstock baseline.
 - `conditionId` 1500 is persisted but excluded from the baseline.
   *— baseline anchors all six derived tiers; contaminating it propagates error everywhere*
-- `conditionId` 3000 maps to the used tiers.
+- `conditionId` 3000 is excluded from valuation entirely. It previously mapped to the used tiers, which the MVP no longer values (`docs/scope_deadstock_only.md`). It is a non-issue in practice regardless: `apify_backfill.py` sends `itemCondition: "new"`, so `sold_comps` holds zero rows at 3000. Any that slip through are persisted and ignored, not dropped — keeping the raw `conditionId` is what lets used valuation return in v1.1 without re-scraping.
 
 ### Aggregation
 
