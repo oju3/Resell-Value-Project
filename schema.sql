@@ -71,7 +71,11 @@ CREATE TABLE owned_sneakers (
     has_box BOOLEAN,
     has_receipt BOOLEAN,
     defects TEXT,
-    purchase_price NUMERIC,
+    -- CHECK, not just API validation: a negative purchase price produces
+    -- nonsense P/L rather than an obvious error, and scripts/psql write here
+    -- too. NULL still passes -- a CHECK is satisfied when it evaluates to
+    -- NULL -- so this constrains the value without making the column required.
+    purchase_price NUMERIC CHECK (purchase_price > 0),
     purchase_date DATE,
     -- Fixed vocabulary, lowercase slugs. Lowercase matches
     -- platform_fees.platform, which sold_sneakers.sale_platform must equal
@@ -270,10 +274,10 @@ CREATE TABLE sold_sneakers (
     user_id UUID NOT NULL REFERENCES auth.users(id),
     sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
     size TEXT,
-    purchase_price NUMERIC NOT NULL,
+    purchase_price NUMERIC NOT NULL CHECK (purchase_price > 0),
     purchase_date DATE,
     purchase_source TEXT,
-    sale_price NUMERIC NOT NULL,
+    sale_price NUMERIC NOT NULL CHECK (sale_price > 0),
     sale_platform TEXT NOT NULL CHECK (sale_platform IN ('ebay', 'stockx', 'goat')),
     sale_date DATE NOT NULL,
     fee_percent_applied NUMERIC NOT NULL,

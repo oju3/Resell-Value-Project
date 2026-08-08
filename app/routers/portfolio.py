@@ -15,7 +15,7 @@ from datetime import date
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.auth import get_current_user_id
 from app.db import get_conn
@@ -36,13 +36,17 @@ class AddPairRequest(BaseModel):
     touched. The CHECK remains the backstop for any other writer."""
     sneaker_id: int
     size: str
-    purchase_price: float
+    # gt=0: there is no legitimate zero or negative purchase price, and a
+    # negative one would produce nonsense P/L rather than an obvious error.
+    # Mirrored by a CHECK constraint in schema.sql so scripts and psql are
+    # bound by the same rule -- this layer only guards the HTTP path.
+    purchase_price: float = Field(gt=0)
     purchase_date: date
     purchase_source: Literal["snkrs", "stockx", "goat", "ebay", "in_store", "other"]
 
 
 class SellPairRequest(BaseModel):
-    sale_price: float
+    sale_price: float = Field(gt=0)
     # Must match platform_fees.platform exactly -- a mismatch would produce a
     # zero-row fee lookup rather than an error.
     sale_platform: Literal["ebay", "stockx", "goat"]

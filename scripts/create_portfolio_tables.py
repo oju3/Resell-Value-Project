@@ -3,6 +3,8 @@
   1. owned_sneakers.purchase_source  -- new column + CHECK on a fixed value list
   2. sold_sneakers                   -- new table for sold pairs
   3. RLS + per-user policies on sold_sneakers, mirroring owned_sneakers
+  4. CHECK (price > 0) on owned_sneakers.purchase_price and on
+     sold_sneakers.purchase_price / sale_price
 
 Sold pairs live in their own table rather than behind a status flag on
 owned_sneakers, so "what I own" and "what I sold" stay two clean queries.
@@ -61,11 +63,11 @@ try:
 
                 -- Copied from owned_sneakers at the moment of sale, because
                 -- that row is deleted by the same transaction.
-                purchase_price NUMERIC NOT NULL,
+                purchase_price NUMERIC NOT NULL CHECK (purchase_price > 0),
                 purchase_date DATE,
                 purchase_source TEXT,
 
-                sale_price NUMERIC NOT NULL,
+                sale_price NUMERIC NOT NULL CHECK (sale_price > 0),
                 sale_platform TEXT NOT NULL CHECK (sale_platform IN ('ebay','stockx','goat')),
                 sale_date DATE NOT NULL,
 
@@ -92,6 +94,28 @@ try:
             CREATE INDEX IF NOT EXISTS idx_sold_sneakers_user_id
             ON sold_sneakers (user_id);
         """)
+
+        # Positive-price constraints, enforced in the database as well as at
+        # the API layer so scripts and psql are bound by the same rule. There
+        # is no legitimate zero or negative price, and a negative purchase
+        # price would produce nonsense P/L rather than an obvious error.
+        #
+        # NULL passes a CHECK (the constraint is satisfied unless it evaluates
+        # to false), so owned_sneakers.purchase_price stays nullable.
+        #
+        # Applied as ALTERs rather than relying on the inline CHECKs above,
+        # because CREATE TABLE IF NOT EXISTS is a no-op on an existing table
+        # and would silently skip them on any database already migrated.
+        for constraint, table, column in (
+            ("owned_sneakers_purchase_price_positive", "owned_sneakers", "purchase_price"),
+            ("sold_sneakers_purchase_price_positive", "sold_sneakers", "purchase_price"),
+            ("sold_sneakers_sale_price_positive", "sold_sneakers", "sale_price"),
+        ):
+            cur.execute("SELECT 1 FROM pg_constraint WHERE conname = %s;", (constraint,))
+            if not cur.fetchone():
+                cur.execute(
+                    f"ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({column} > 0);"
+                )
 
         # RLS mirrors owned_sneakers. Defence-in-depth only: this API connects
         # with psycopg2, where auth.uid() is NULL and the role bypasses RLS,
