@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.auth import get_current_user_id
 from app.db import get_conn
+from app.goat_sales import get_goat_median
 from app.valuation import get_valuation
 
 router = APIRouter(tags=["valuation"])
@@ -45,4 +46,9 @@ def sneaker_valuation(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Sneaker not found",
         )
+    # Two medians from two markets, as two labelled fields. Never blended,
+    # never averaged -- they measure different things. goat_median is null for
+    # a sneaker with no GOAT data; goat_sample_size carries the row count so a
+    # thin sample is visible without a confidence label.
+    valuation.update(get_goat_median(conn, sneaker_id))
     return valuation

@@ -381,7 +381,11 @@ def get_valuation(conn, sneaker_id: int) -> Optional[dict]:
         "name": name,
         "style_code": style_code,
 
-        "value": _round(value, PRICE_DP),
+        # Renamed from "value": this endpoint now returns two medians from two
+        # different markets, so neither may carry a name implying it is THE
+        # value. get_values_for_sneakers() above deliberately still returns
+        # "value" -- it feeds the portfolio's current_value and is eBay-only.
+        "ebay_median": _round(value, PRICE_DP),
         "q1": _round(q1, PRICE_DP),
         "q3": _round(q3, PRICE_DP),
         "risk_pct": _round(risk_pct, PERCENT_DP),
