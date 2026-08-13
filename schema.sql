@@ -1,5 +1,5 @@
 -- Sneaker resale valuation app: core schema
--- 10 tables + RLS. See CLAUDE.md for project context.
+-- 14 tables + RLS. See CLAUDE.md for project context.
 
 -- Required extensions
 -- pg_trgm powers the fuzzy fallback stage of GET /sneakers/search (see
@@ -305,6 +305,55 @@ CREATE TABLE sold_sneakers (
 );
 CREATE INDEX idx_sold_sneakers_user_id ON sold_sneakers (user_id);
 
+-- 14. market_sales: real GOAT sold transactions, one row per sale.
+-- Pulled from KicksDB /v3/goat/products/{goat_product_id}/sales by
+-- scripts/fetch_goat_sales.py, for every sneaker with a populated
+-- sneakers.goat_product_id.
+--
+-- No `source` column by design: every row here came from GOAT by
+-- construction, so the table is its own provenance. A second platform means a
+-- new table, or a source column added then with a backfill for these rows --
+-- not a column with exactly one value in it now.
+--
+-- goat_product_id is TEXT to match sneakers.goat_product_id exactly. The sales
+-- response returns product_id as a JSON NUMBER (1293064, not "1293064"), so
+-- the loader stringifies before comparing or inserting; a number on one side
+-- and text on the other is how a join silently returns zero rows later.
+--
+-- KNOWN GAP -- NO DEDUPLICATION. Deliberately no unique constraint on
+-- (goat_product_id, purchased_at, size_us, amount) or anything else, and the
+-- loader has no ON CONFLICT clause, so re-running fetch_goat_sales.py WILL
+-- insert duplicate rows. Accepted for the first pass, recorded here so it is
+-- visible rather than discovered later.
+--
+-- amount and currency are stored exactly as returned, never converted.
+CREATE TABLE market_sales (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
+    goat_product_id TEXT NOT NULL,
+    -- Payload columns are nullable: a response row missing one field should
+    -- still land with the rest intact rather than failing the whole batch.
+    -- raw_response preserves whatever was actually returned.
+    size_us TEXT,
+    currency TEXT,
+    amount NUMERIC,
+    purchase_type TEXT,
+    location TEXT,
+    purchased_at TIMESTAMPTZ,
+    raw_response JSONB,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_market_sales_sneaker ON market_sales (sneaker_id);
+COMMENT ON TABLE market_sales IS
+    'Real GOAT sold transactions from KicksDB /v3/goat/products/{id}/sales, one row per sale. '
+    'No source column: every row is GOAT by construction. '
+    'NO DEDUPLICATION -- re-running scripts/fetch_goat_sales.py inserts duplicates. '
+    'amount/currency are stored exactly as returned, never converted.';
+COMMENT ON COLUMN market_sales.raw_response IS
+    'The individual sale object as returned, not the full response envelope. '
+    'The complete envelope is cached to cache/kicksdb_goat_sales/{goat_product_id}.json. '
+    'Keeps any field not mapped to a column above from being lost.';
+
 -- Row Level Security
 ALTER TABLE sneakers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_history ENABLE ROW LEVEL SECURITY;
@@ -319,6 +368,7 @@ ALTER TABLE comp_rejections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE platform_multipliers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE refresh_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sold_sneakers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE market_sales ENABLE ROW LEVEL SECURITY;
 
 -- Public read on all market/reference data; writes only via service role (bypasses RLS)
 CREATE POLICY "public read" ON sneakers FOR SELECT USING (true);
@@ -332,6 +382,7 @@ CREATE POLICY "public read" ON sold_comps FOR SELECT USING (true);
 CREATE POLICY "public read" ON comp_rejections FOR SELECT USING (true);
 CREATE POLICY "public read" ON platform_multipliers FOR SELECT USING (true);
 CREATE POLICY "public read" ON refresh_runs FOR SELECT USING (true);
+CREATE POLICY "public read" ON market_sales FOR SELECT USING (true);
 
 -- owned_sneakers: users can only touch their own rows
 CREATE POLICY "select own" ON owned_sneakers FOR SELECT USING (auth.uid() = user_id);
