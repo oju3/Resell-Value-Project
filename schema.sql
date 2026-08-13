@@ -23,8 +23,25 @@ CREATE TABLE sneakers (
     colorway TEXT,
     image_url TEXT,
     release_date DATE,
-    hype_tier INT CHECK (hype_tier BETWEEN 1 AND 3)
+    hype_tier INT CHECK (hype_tier BETWEEN 1 AND 3),
+    -- Nullable on purpose. Populated by scripts/fetch_goat_product_ids.py from
+    -- KicksDB's unified products endpoint; a sneaker with no GOAT listing (SKU
+    -- format mismatch, delisted, never carried) keeps NULL. NULL means "not
+    -- looked up or not found" and must never be filled with a placeholder.
+    --
+    -- TEXT, not an integer, even though the observed GOAT value looks numeric
+    -- ("1293064"). It is an external vendor identifier: nothing does arithmetic
+    -- on it, leading zeros would be significant if they ever appeared, and the
+    -- format is KicksDB's to change. The same response field carries a UUID for
+    -- stockx. No UNIQUE and no index: a UNIQUE would turn a duplicate id from
+    -- the vendor into a mid-backfill failure rather than something the loader
+    -- can report.
+    goat_product_id TEXT
 );
+COMMENT ON COLUMN sneakers.goat_product_id IS
+    'GOAT source_product_id from KicksDB /v3/unified/products/{sku}. '
+    'NULL means not looked up, or no goat entry in the response -- never a placeholder. '
+    'Populated by scripts/fetch_goat_product_ids.py.';
 
 -- 2. price_history: daily eBay sold-price feed
 CREATE TABLE price_history (
