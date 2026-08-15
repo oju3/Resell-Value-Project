@@ -1,5 +1,5 @@
 -- Sneaker resale valuation app: core schema
--- 14 tables + RLS. See CLAUDE.md for project context.
+-- 15 tables + RLS. See CLAUDE.md for project context.
 
 -- Required extensions
 -- pg_trgm powers the fuzzy fallback stage of GET /sneakers/search (see
@@ -354,6 +354,70 @@ COMMENT ON COLUMN market_sales.raw_response IS
     'The complete envelope is cached to cache/kicksdb_goat_sales/{goat_product_id}.json. '
     'Keeps any field not mapped to a column above from being lost.';
 
+-- 15. goat_daily_sales: GOAT's PRE-AGGREGATED daily feed, one row per DAY.
+-- From KicksDB /v3/goat/products/{id}/sales/daily, written by
+-- scripts/fetch_goat_daily_sales.py.
+--
+-- DISTINCT FROM market_sales (14). That table holds individual transactions
+-- from the /sales endpoint; this holds GOAT's own daily rollup from
+-- /sales/daily. Different endpoint, different response shape, different grain.
+-- avg_amount here is GOAT's average, NOT something recomputed from
+-- market_sales rows -- do not join or compare the two casually.
+--
+-- `orders` is the count of sales that day's avg_amount was computed from, and
+-- is the per-day liquidity/confidence signal. Stored as returned, never
+-- recomputed.
+--
+-- SPARSE BY DESIGN. The endpoint returns a row only for days on which at least
+-- one sale happened, so a low-volume sneaker produces a gapped series. An
+-- absent date means no sale occurred that day. Nothing fills, interpolates, or
+-- backfills those gaps -- the gaps ARE the trading-activity signal.
+--
+-- Observed on the first batch: the endpoint appears to cap at 100 rows (two of
+-- three sneakers returned exactly 100, one returned 91). If so the series is
+-- truncated at the OLD end, so MIN(sale_date) is "as far back as the API went",
+-- not "first sale ever". meta was null on every response, so there is no cursor
+-- to page with.
+--
+-- UNIQUE (goat_product_id, sale_date), and the loader uses ON CONFLICT DO
+-- UPDATE. Deliberately the opposite of market_sales' documented no-dedup gap: a
+-- daily aggregate for a date is one fact a fresher pull should overwrite, so
+-- re-running the loader is idempotent rather than additive. ingested_at is
+-- reset on update, so it reads as "last refreshed", not "first landed".
+--
+-- No currency column: every sale in the underlying /sales feed was verified
+-- USD, and this aggregates those same sales. The loader hard-stops if a
+-- currency field ever appears with a non-USD value.
+CREATE TABLE goat_daily_sales (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sneaker_id BIGINT NOT NULL REFERENCES sneakers(id),
+    goat_product_id TEXT NOT NULL,
+    sale_date DATE NOT NULL,
+    -- GOAT's own average for that day, and the order count it was computed
+    -- from. Both stored as returned, never recomputed.
+    avg_amount NUMERIC,
+    orders INT,
+    raw_response JSONB,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The dedup key. One daily aggregate per product per date; a re-run
+    -- refreshes it in place rather than appending.
+    UNIQUE (goat_product_id, sale_date)
+);
+CREATE INDEX idx_goat_daily_sales_sneaker ON goat_daily_sales (sneaker_id);
+COMMENT ON TABLE goat_daily_sales IS
+    'GOAT pre-aggregated daily sales from KicksDB /v3/goat/products/{id}/sales/daily. '
+    'One row per DAY, and only for days with at least one sale -- gaps are real and are '
+    'never filled or interpolated. Distinct from market_sales, which holds individual '
+    'transactions from the /sales endpoint. avg_amount and orders come straight from '
+    'GOAT and are never recomputed. UNIQUE (goat_product_id, sale_date): re-running the '
+    'loader refreshes a day in place, it does not duplicate.';
+COMMENT ON COLUMN goat_daily_sales.orders IS
+    'Count of sales the day''s avg_amount was computed from. This is the per-day '
+    'liquidity/confidence signal -- use as-is, do not recompute from market_sales.';
+COMMENT ON COLUMN goat_daily_sales.raw_response IS
+    'The individual daily object as returned, not the full response envelope. '
+    'The complete envelope is cached to cache/kicksdb_goat_daily/{goat_product_id}.json.';
+
 -- Row Level Security
 ALTER TABLE sneakers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_history ENABLE ROW LEVEL SECURITY;
@@ -369,6 +433,7 @@ ALTER TABLE platform_multipliers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE refresh_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sold_sneakers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE market_sales ENABLE ROW LEVEL SECURITY;
+ALTER TABLE goat_daily_sales ENABLE ROW LEVEL SECURITY;
 
 -- Public read on all market/reference data; writes only via service role (bypasses RLS)
 CREATE POLICY "public read" ON sneakers FOR SELECT USING (true);
@@ -383,6 +448,7 @@ CREATE POLICY "public read" ON comp_rejections FOR SELECT USING (true);
 CREATE POLICY "public read" ON platform_multipliers FOR SELECT USING (true);
 CREATE POLICY "public read" ON refresh_runs FOR SELECT USING (true);
 CREATE POLICY "public read" ON market_sales FOR SELECT USING (true);
+CREATE POLICY "public read" ON goat_daily_sales FOR SELECT USING (true);
 
 -- owned_sneakers: users can only touch their own rows
 CREATE POLICY "select own" ON owned_sneakers FOR SELECT USING (auth.uid() = user_id);
