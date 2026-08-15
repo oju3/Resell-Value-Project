@@ -63,9 +63,11 @@ RANDOM_SEED = 42
 # yields numbers a user should act on.
 SUPPRESSED_TIERS = ("suppressed", "insufficient_data")
 
-# Matches PRICE_DP in app/valuation.py so money rounds identically across
-# sibling endpoints.
+# Match app/valuation.py so money and percentages round identically across
+# sibling endpoints -- a frontend showing both should not get 36.1 from one and
+# 15 decimal places from the other.
 PRICE_DP = 2
+PERCENT_DP = 1
 
 
 # LEFT JOIN, not an inner join: a sneaker that exists but was never processed
@@ -185,7 +187,8 @@ def build_projection_response(conn, sneaker_id: int) -> Optional[dict]:
         "name": projection["name"],
         "style_code": projection["style_code"],
         "confidence_tier": projection["confidence_tier"],
-        "mape": projection["mape"],
+        # None-guarded: mape is null for a sneaker that was never processed.
+        "mape": None if projection["mape"] is None else round(projection["mape"], PERCENT_DP),
         "n_rows": projection["n_rows"],
         "half_life_days": projection["half_life_days"],
         "horizons": [],
