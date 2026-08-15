@@ -1,0 +1,40 @@
+import os
+import psycopg2
+from dotenv import load_dotenv
+from datetime import timedelta
+from collections import defaultdict
+import statistics
+
+load_dotenv('.env')
+conn = psycopg2.connect(os.environ['DATABASE_URL'])
+
+def get_weekly_price_series(conn, style_code):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT sc.sold_price, sc.ended_at
+            FROM sold_comps sc
+            JOIN sneakers s ON s.id = sc.sneaker_id
+            WHERE s.style_code = %s
+            ORDER BY sc.ended_at;
+        """, (style_code,))
+        rows = cur.fetchall()
+
+    if not rows:
+        return []
+
+    buckets = defaultdict(list)
+    for price, ended_at in rows:
+        week_start = ended_at - timedelta(days=ended_at.weekday())
+        buckets[week_start].append(float(price))
+
+    series = [
+        (week, statistics.median(prices), len(prices))
+        for week, prices in sorted(buckets.items())
+    ]
+    return series
+
+series = get_weekly_price_series(conn, 'FV5029-006')
+for week, median_price, n in series:
+    print(f"{week}  ${median_price:.2f}  (n={n})")
+
+conn.close()
