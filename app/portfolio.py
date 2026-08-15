@@ -44,6 +44,7 @@ at the boundary rather than mixed.
 """
 from typing import Optional
 
+from app.fees import get_fee_for_price
 from app.valuation import get_values_for_sneakers
 
 # Mirrors the CHECK constraints in schema.sql. The router's Pydantic models
@@ -55,30 +56,12 @@ SALE_PLATFORMS = ("ebay", "stockx", "goat")
 MONEY_DP = 2
 
 
-# The banded fee lookup. platform_fees stores a fee schedule per (platform,
-# price band) -- eBay charges 13.25% + $0.30 below $150 and 8% + $0 at or above
-# it -- so the fee depends on the SALE PRICE, not on the platform alone.
-#
-# THE BOUNDARY IS HALF-OPEN ON PURPOSE: >= min_price AND < max_price.
-# --------------------------------------------------------------------
-# The bands as seeded are [0, 150] and [150, NULL] -- they TOUCH at 150. The
-# intuitive rule `price >= min_price AND price <= max_price` therefore matches
-# BOTH eBay rows at exactly $150.00 (verified against live data: 2 rows, 13.25%
-# and 8.00%), and which one wins is whatever the planner returns first. That is
-# a real bug that appears at exactly one price point and reads as flakiness.
-#
-# Half-open intervals fix it the standard way: every price falls in exactly one
-# band, bands tile the number line with no gap and no overlap. At $150 the 8%
-# band wins. Confirmed at $0, $149.99, $150.00, $150.01 and $5000.
-#
-# max_price IS NULL means unbounded -- how StockX and GOAT have a single band.
-_FEE_BAND_SQL = """
-SELECT fee_percent, fixed_fee
-FROM platform_fees
-WHERE platform = %(platform)s
-  AND %(sale_price)s >= min_price
-  AND (max_price IS NULL OR %(sale_price)s < max_price);
-"""
+# The banded fee lookup now lives in app/fees.py::get_fee_for_price, imported
+# above. It moved out of this file when app/recommendation.py became a second
+# caller -- two copies of the half-open band logic would drift apart, and the
+# $150 boundary bug it guards against only shows up at exactly one price.
+# Behaviour here is unchanged: the same SQL, the same half-open interval, and
+# the same raw Decimal values fed into the NUMERIC arithmetic below.
 
 _ADD_PAIR_SQL = """
 INSERT INTO owned_sneakers
@@ -285,11 +268,7 @@ def mark_sold(conn, user_id, owned_id, sale_price, sale_platform, sale_date):
     """
     with conn:
         with conn.cursor() as cur:
-            cur.execute(_FEE_BAND_SQL, {
-                "platform": sale_platform,
-                "sale_price": sale_price,
-            })
-            band = cur.fetchone()
+            band = get_fee_for_price(conn, sale_price, sale_platform)
             if band is None:
                 return "no_fee_band"
             fee_percent, fixed_fee = band
