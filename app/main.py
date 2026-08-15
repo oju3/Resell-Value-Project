@@ -17,7 +17,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.db import close_pool, init_pool
-from app.routers import health, me, portfolio, projections, sneakers, valuation
+from app.routers import (
+    health,
+    me,
+    portfolio,
+    projections,
+    recommendation,
+    sneakers,
+    valuation,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -46,5 +54,6 @@ app.include_router(health.router)
 app.include_router(me.router)
 app.include_router(portfolio.router)
 app.include_router(projections.router)
+app.include_router(recommendation.router)
 app.include_router(sneakers.router)
 app.include_router(valuation.router)
