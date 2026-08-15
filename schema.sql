@@ -1,5 +1,5 @@
 -- Sneaker resale valuation app: core schema
--- 15 tables + RLS. See CLAUDE.md for project context.
+-- 16 tables + RLS. See CLAUDE.md for project context.
 
 -- Required extensions
 -- pg_trgm powers the fuzzy fallback stage of GET /sneakers/search (see
@@ -418,6 +418,86 @@ COMMENT ON COLUMN goat_daily_sales.raw_response IS
     'The individual daily object as returned, not the full response envelope. '
     'The complete envelope is cached to cache/kicksdb_goat_daily/{goat_product_id}.json.';
 
+-- 16. sneaker_projections: tuned weighted-linear trend per sneaker.
+-- One row per sneaker, fitted over goat_daily_sales (15) by
+-- scripts/build_sneaker_projections.py. Derived from
+-- scripts/exploration/per_sneaker_halflife.py, which is the archived validation
+-- work behind the model.
+--
+-- DERIVED AND REBUILDABLE. UNIQUE (sneaker_id) with ON CONFLICT DO UPDATE, so
+-- re-running the builder as goat_daily_sales accumulates refreshes each row in
+-- place. Same reasoning as goat_daily_sales, deliberately NOT market_sales --
+-- there is no meaningful "second projection" for a sneaker, only a fresher one.
+--
+-- HOW THE HALF-LIFE IS CHOSEN vs HOW THE STORED FIT IS PRODUCED -- these differ,
+-- and conflating them misreads every row. The half-life is selected by backtest:
+-- train on the first 75% of a sneaker's daily rows, score MAPE against the
+-- held-out last 25%, keep the lowest. slope_per_day/intercept/residual_stdev are
+-- then REFIT on 100% of the rows at that half-life. The backtest's only job is
+-- choosing the half-life; the production fit does not throw away the most recent
+-- 25% of real data forever. So mape describes the CHOICE, not the error of the
+-- stored fit.
+--
+-- Each row is weighted by exp(-ln(2)/half_life * days_before_most_recent), so a
+-- row one half-life old counts half as much as the newest. The half-life is
+-- tuned per sneaker because the right amount of recency bias is not a global
+-- constant -- on this catalogue the winner ranges across the whole candidate
+-- list, 30d winning 17 of 43 but 2d winning for the fastest-moving shoes.
+--
+-- Linear trend only. Non-linear/curve fitting was deliberately deferred: real
+-- overfitting risk on 22-100 data points against a small expected gain. This
+-- table stores the inputs Monte Carlo will consume later; it does not run Monte
+-- Carlo, and that band is applied as a constant per horizon rather than widening
+-- with distance -- a documented limitation, not fixed here.
+CREATE TABLE sneaker_projections (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    -- UNIQUE, not just FK: one current projection per sneaker, and the
+    -- ON CONFLICT target. No separate index needed -- UNIQUE creates one.
+    sneaker_id BIGINT NOT NULL UNIQUE REFERENCES sneakers(id),
+    -- All five NULL together when confidence_tier is 'insufficient_data'.
+    -- Never partially populated.
+    half_life_days INT,
+    slope_per_day NUMERIC,
+    intercept NUMERIC,
+    residual_stdev NUMERIC,
+    mape NUMERIC,
+    -- Always known, including for insufficient_data rows, where it is the
+    -- reason for the tier -- hence NOT NULL.
+    n_rows INT NOT NULL,
+    reference_date DATE,
+    confidence_tier TEXT NOT NULL CHECK (confidence_tier IN
+        ('normal', 'low_confidence', 'suppressed', 'insufficient_data')),
+    -- The whole swept list, not just the winner.
+    half_life_candidates JSONB NOT NULL,
+    computed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE sneaker_projections IS
+    'Tuned weighted-linear trend per sneaker over goat_daily_sales, with the backtest '
+    'evidence behind it. Derived and rebuildable: UNIQUE (sneaker_id) with ON CONFLICT '
+    'DO UPDATE, so re-running the builder refreshes rather than duplicates. The '
+    'half-life is CHOSEN by backtest on the first 75% of rows, but the stored fit is '
+    'REFIT on 100% of rows at that half-life. Linear trend only -- non-linear fitting '
+    'was deliberately deferred (overfitting risk on 22-100 points). Stores the inputs '
+    'Monte Carlo will consume later; does not run Monte Carlo.';
+COMMENT ON COLUMN sneaker_projections.reference_date IS
+    'x = 0 for the fitted line: predicted = intercept + slope_per_day * '
+    '(target_date - reference_date in days). Equals the sneaker''s earliest '
+    'goat_daily_sales date at build time. Stored rather than re-derived because '
+    'MIN(sale_date) shifts if older daily rows ever arrive, which would silently '
+    'invalidate every stored intercept.';
+COMMENT ON COLUMN sneaker_projections.n_rows IS
+    'Count of goat_daily_sales rows the fit was built from. Lets a stored MAPE be read '
+    'in context -- 10% off 22 points is not 10% off 100 points. Populated even for '
+    'insufficient_data rows, where it is the reason for that tier.';
+COMMENT ON COLUMN sneaker_projections.confidence_tier IS
+    'normal (MAPE<=15), low_confidence (15<MAPE<=25), suppressed (MAPE>25, evaluated '
+    'and found unreliable), insufficient_data (<8 daily rows, could not be evaluated). '
+    'Suppressed rows are still inserted -- absence would look like never-evaluated.';
+COMMENT ON COLUMN sneaker_projections.mape IS
+    'Mean absolute percentage error of the winning half-life against the held-out last '
+    '25% of rows. Backtest evidence for the choice, NOT the error of the stored fit '
+    '(which was refit on 100% of rows).';
+
 -- Row Level Security
 ALTER TABLE sneakers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_history ENABLE ROW LEVEL SECURITY;
@@ -434,6 +514,7 @@ ALTER TABLE refresh_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sold_sneakers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE market_sales ENABLE ROW LEVEL SECURITY;
 ALTER TABLE goat_daily_sales ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sneaker_projections ENABLE ROW LEVEL SECURITY;
 
 -- Public read on all market/reference data; writes only via service role (bypasses RLS)
 CREATE POLICY "public read" ON sneakers FOR SELECT USING (true);
@@ -449,6 +530,7 @@ CREATE POLICY "public read" ON platform_multipliers FOR SELECT USING (true);
 CREATE POLICY "public read" ON refresh_runs FOR SELECT USING (true);
 CREATE POLICY "public read" ON market_sales FOR SELECT USING (true);
 CREATE POLICY "public read" ON goat_daily_sales FOR SELECT USING (true);
+CREATE POLICY "public read" ON sneaker_projections FOR SELECT USING (true);
 
 -- owned_sneakers: users can only touch their own rows
 CREATE POLICY "select own" ON owned_sneakers FOR SELECT USING (auth.uid() = user_id);
