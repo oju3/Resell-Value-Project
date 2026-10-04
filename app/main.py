@@ -15,6 +15,8 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+import os
+
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import close_pool, init_pool
@@ -74,6 +76,13 @@ app = FastAPI(
 FRONTEND_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+]
+# Deployed frontend origins, comma-separated, set in the host's dashboard.
+# Exact strings only, no trailing slash, e.g. https://soletrack.vercel.app
+FRONTEND_ORIGINS += [
+    o.strip().rstrip("/")
+    for o in os.environ.get("EXTRA_FRONTEND_ORIGINS", "").split(",")
+    if o.strip()
 ]
 
 app.add_middleware(
